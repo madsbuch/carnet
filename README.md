@@ -84,6 +84,28 @@ Two Android-specific notes:
    storage. Use [FolderSync](https://foldersync.io/) (or Dropsync) to two-way sync your
    Dropbox to e.g. `/storage/emulated/0/Dropbox`, then point Carnet at that folder.
 
+## CI builds
+
+Every push to `main` runs [.github/workflows/build.yml](.github/workflows/build.yml): tests, a
+universal macOS `.dmg` (Apple Silicon + Intel), and an installable Android `.apk` — all three
+downloadable from the run's **Artifacts** on GitHub.
+
+- **macOS:** the `.dmg` is unsigned/un-notarized, so the first launch needs right-click → Open
+  (or `xattr -dr com.apple.quarantine /Applications/Carnet.app`).
+- **Android:** the APK already carries the storage permission (CI patches the generated manifest);
+  after installing, grant Carnet "All files access" in Android settings. Without signing secrets
+  the APK is signed with a throwaway key, so each new build needs uninstall-then-install. For
+  in-place updates, create a keystore once and add it as repository secrets:
+
+  ```sh
+  keytool -genkeypair -keystore carnet.jks -alias carnet -keyalg RSA -keysize 2048 -validity 10000
+  base64 -i carnet.jks | pbcopy   # → secret ANDROID_KEYSTORE_B64
+  ```
+
+  Secrets: `ANDROID_KEYSTORE_B64` (the base64 above), `ANDROID_KEYSTORE_PASSWORD`, and
+  `ANDROID_KEY_ALIAS` (`carnet` if you used the command as-is). Keep `carnet.jks` somewhere safe —
+  losing it means reinstalling instead of updating.
+
 ## Layout
 
 ```

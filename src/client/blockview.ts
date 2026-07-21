@@ -7,9 +7,26 @@
 // creates the next item; Enter in a paragraph starts a new block; a toolbar on
 // the active block retypes it (¶/H1-H3/•/☑/❝). The file is never rewritten
 // wholesale — every edit is a line splice on what was typed.
+//
+// State invariants:
+// - `active` is the one live edit session. commit(false) flushes its text but
+//   keeps the session alive while the textarea still has focus (Cmd+S,
+//   app-switch); it only closes on blur/navigation (forceClose) or render.
+// - `staleDom` means the DOM no longer matches the content (a flush happened
+//   without a re-render, mid tap-through); `staleShifted` additionally means
+//   line numbers moved, so handlers holding line coordinates must drop their
+//   action instead of acting on stale positions.
 import { marked } from "marked";
-import { convertBlock, nextItemPrefix, segmentBlocks, stripBlockPrefixes, type Block, type TargetType } from "../blocks";
-import { normalizeTasks, taskLinesIn, toggleTaskAtLine } from "../links";
+import {
+  convertBlock,
+  itemContentStart,
+  nextItemPrefix,
+  segmentBlocks,
+  stripBlockPrefixes,
+  type Block,
+  type TargetType,
+} from "../blocks";
+import { normalizeTasks, taskLinesIn, taskState, toggleTaskAtLine } from "../links";
 
 export interface BlockHost {
   content(): string;
@@ -26,10 +43,12 @@ export interface BlockHost {
 interface ActiveEdit {
   start: number;
   end: number;
+  /** The block's end line as the rendered DOM knows it (for stale adjustments). */
+  domEnd: number;
   original: string;
   wrap: HTMLElement;
   textarea: HTMLTextAreaElement;
-  /** Appending after the current end of the note (no lines replaced). */
+  /** Appending after the current end of the note (no lines replaced yet). */
   append?: boolean;
 }
 
@@ -52,8 +71,8 @@ const TOOLS: { t: TargetType | "delete"; label: string; title: string }[] = [
 
 export class BlockView {
   private active: ActiveEdit | null = null;
-  /** A commit happened without re-render (mid tap-through to another block). */
   private staleDom = false;
+  private staleShifted = false;
   private lineDelta = 0;
   private commitEnd = -1;
 
@@ -68,11 +87,17 @@ export class BlockView {
     return this.active !== null;
   }
 
+  /** Flush and close any edit session without re-rendering (navigation). */
+  flush(): boolean {
+    return this.commit(false, true);
+  }
+
   /* ---------- rendering ---------- */
 
   render(): void {
     this.active = null;
     this.staleDom = false;
+    this.staleShifted = false;
     const src = this.host.content();
     const lines = src.split("\n");
     const blocks = segmentBlocks(src);
@@ -162,6 +187,7 @@ export class BlockView {
 
   private postprocess(src: string): void {
     const c = this.container;
+    const srcLines = src.split("\n");
     c.querySelectorAll<HTMLAnchorElement>("a.wiki").forEach((a) => {
       const name = a.dataset.name ?? "";
       if (!this.host.wikiExists(name)) a.classList.add("missing");
@@ -186,12 +212,15 @@ export class BlockView {
       const mapped = this.host.imageSrc(img.getAttribute("src") ?? "");
       if (mapped) img.src = mapped;
     });
-    // checkboxes: block-scoped mapping, only wired when DOM and source agree
+    // checkboxes: block-scoped mapping, only wired when the DOM and the source
+    // agree on both the count AND every box's checked state
     c.querySelectorAll<HTMLElement>("[data-start]").forEach((el) => {
       const boxes = [...el.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')];
       if (boxes.length === 0) return;
       const taskLines = taskLinesIn(src, Number(el.dataset.start), Number(el.dataset.end));
-      if (taskLines.length !== boxes.length) return; // unsafe mapping → read-only
+      if (taskLines.length !== boxes.length) return;
+      const agree = boxes.every((box, k) => taskState(srcLines[taskLines[k]]) === box.checked);
+      if (!agree) return; // unsafe mapping → read-only
       boxes.forEach((box, k) => {
         box.disabled = false;
         box.addEventListener("click", (e) => e.stopPropagation());
@@ -211,11 +240,16 @@ export class BlockView {
     window.scrollTo(0, y);
   }
 
-  /** If the DOM is stale from a render-less commit, re-render and report it. */
+  /**
+   * Settle a stale DOM before acting on it. Returns true when the pending
+   * action must be dropped because its captured line numbers moved.
+   */
   private consumeStale(): boolean {
     if (!this.staleDom) return false;
-    this.rerenderKeepScroll();
-    return true;
+    const shifted = this.staleShifted;
+    if (this.active) this.commit(); // flush + render, never lose typed text
+    else this.rerenderKeepScroll();
+    return shifted;
   }
 
   /* ---------- editing ---------- */
@@ -234,7 +268,7 @@ export class BlockView {
     if (this.active && this.active.wrap.contains(el)) return;
     let start = Number(el.dataset.start);
     let end = Number(el.dataset.end);
-    if (this.active) this.commit(false); // blur usually did this already
+    if (this.active) this.commit(false, true); // blur usually closed it already
     if (this.staleDom && start > this.commitEnd) {
       start += this.lineDelta;
       end += this.lineDelta;
@@ -243,18 +277,41 @@ export class BlockView {
     this.openRange(start, end, caret);
   }
 
-  /** Open an editor over the given line range. */
+  /**
+   * Open an editor over the given line range. The range snaps outward to the
+   * whole block containing its first line, so editors always cover complete
+   * blocks — nothing gets hidden or half-replaced while editing.
+   */
   openRange(start: number, end: number, caret: number): void {
     this.render(); // clean DOM from current content; clears active/stale state
-    const lines = this.host.content().split("\n");
-    const cStart = Math.max(0, Math.min(start, lines.length - 1));
-    const cEnd = Math.max(cStart, Math.min(end, lines.length - 1));
+    const content = this.host.content();
+    const lines = content.split("\n");
+    let cStart = Math.max(0, Math.min(start, lines.length - 1));
+    let cEnd = Math.max(cStart, Math.min(end, lines.length - 1));
+    const hit = segmentBlocks(content).find((b) => b.type !== "blank" && b.start <= cStart && cStart <= b.end);
+    if (hit) {
+      cStart = hit.start;
+      cEnd = Math.max(cEnd, hit.end);
+    }
     const text = lines.slice(cStart, cEnd + 1).join("\n");
     const wrap = this.buildEditor(text);
-    const el = this.container.querySelector<HTMLElement>(`[data-start="${cStart}"]`);
-    if (el) el.replaceWith(wrap);
-    else this.container.appendChild(wrap);
-    this.activate(wrap, { start: cStart, end: cEnd, original: text }, caret);
+    const exact = this.container.querySelector<HTMLElement>(`[data-start="${cStart}"]`);
+    if (exact) {
+      exact.replaceWith(wrap);
+    } else {
+      // no element renders this line (blank or brand-new): insert the editor
+      // at its position in document order, not at the bottom of the note
+      const following = [...this.container.querySelectorAll<HTMLElement>("[data-start]")].find(
+        (other) => Number(other.dataset.start) > cStart,
+      );
+      let anchor: HTMLElement | null = following ?? null;
+      while (anchor && anchor.parentElement !== this.container) {
+        anchor = anchor.parentElement as HTMLElement | null;
+      }
+      if (anchor) this.container.insertBefore(wrap, anchor);
+      else this.container.appendChild(wrap);
+    }
+    this.activate(wrap, { start: cStart, end: cEnd, domEnd: cEnd, original: text }, caret);
   }
 
   /** Open the first block — used for brand-new empty notes. */
@@ -273,7 +330,11 @@ export class BlockView {
     this.render();
     const wrap = this.buildEditor("");
     this.container.appendChild(wrap);
-    this.activate(wrap, { start: -1, end: -1, original: "", append: true }, 0);
+    this.activate(
+      wrap,
+      { start: -1, end: -1, domEnd: Number.MAX_SAFE_INTEGER, original: "", append: true },
+      0,
+    );
   }
 
   private activate(wrap: HTMLElement, edit: Omit<ActiveEdit, "wrap" | "textarea">, caret: number): void {
@@ -317,7 +378,7 @@ export class BlockView {
     textarea.addEventListener("input", () => this.sizeTextarea(textarea));
     textarea.addEventListener("keydown", (e) => this.onEditorKey(e, textarea));
     textarea.addEventListener("blur", () => {
-      this.commit(false);
+      this.commit(false, true);
       // if no follow-up tap claims the stale DOM shortly, settle it
       setTimeout(() => {
         if (this.staleDom && !this.active) this.rerenderKeepScroll();
@@ -328,6 +389,7 @@ export class BlockView {
   }
 
   private onEditorKey(e: KeyboardEvent, textarea: HTMLTextAreaElement): void {
+    if (e.isComposing) return; // never act on IME composition keys
     if (e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
@@ -342,7 +404,12 @@ export class BlockView {
     if (e.key !== "Enter" || e.shiftKey) return;
 
     const value = textarea.value;
+    if (this.active?.append && value.trim() === "") {
+      e.preventDefault(); // Enter in an empty append editor must not spray blanks
+      return;
+    }
     const blk = segmentBlocks(value).find((b) => b.type !== "blank");
+    if (blk?.type === "code") return; // Enter inside a fence is a literal newline
     const pos = textarea.selectionStart;
 
     if (blk?.type === "item") {
@@ -354,8 +421,11 @@ export class BlockView {
         this.replaceActive(["", ""], 1, 0);
         return;
       }
-      const before = value.slice(0, pos);
-      const tail = value.slice(pos, firstLineEnd);
+      // never split inside the marker itself — clamp to where the text starts
+      const contentStart = Math.min(itemContentStart(value), firstLineEnd);
+      const p = Math.max(pos, contentStart);
+      const before = value.slice(0, p);
+      const tail = value.slice(p, firstLineEnd);
       const rest = value.slice(firstLineEnd);
       const prefix = nextItemPrefix(blk);
       const keepLines = (before + rest).split("\n");
@@ -387,36 +457,52 @@ export class BlockView {
     this.openRange(target, target, caretPos);
   }
 
-  /** Commit the active edit into the note. Returns true if content changed. */
-  commit(renderAfter = true): boolean {
+  /**
+   * Flush the active edit into the note. Returns true if content changed.
+   * With renderAfter=false the session stays alive while the textarea keeps
+   * focus (Cmd+S, app-switch) unless forceClose ends it (blur, navigation) —
+   * an orphaned-but-focused textarea would silently swallow keystrokes.
+   */
+  commit(renderAfter = true, forceClose = false): boolean {
     const a = this.active;
     if (!a) {
       if (renderAfter && this.staleDom) this.rerenderKeepScroll();
       return false;
     }
-    this.active = null;
     const value = a.textarea.value;
+    const newLines = value.split("\n");
     const changed = value !== a.original;
-    if (changed || a.append) {
+    if (changed) {
       const lines = this.host.content().split("\n");
-      const newLines = value.split("\n");
       if (a.append) {
         if (value.trim() !== "") {
+          a.start = lines.length + 1; // after the separating blank
           lines.push("", ...newLines);
           this.host.update(lines.join("\n"));
+          a.append = false;
+          a.end = a.start + newLines.length - 1;
+          this.lineDelta = 0;
+          this.commitEnd = Number.MAX_SAFE_INTEGER;
+          this.staleShifted = true;
         }
-        this.lineDelta = 0;
-        this.commitEnd = Number.MAX_SAFE_INTEGER;
       } else {
         lines.splice(a.start, a.end - a.start + 1, ...newLines);
         this.host.update(lines.join("\n"));
-        this.lineDelta = newLines.length - (a.end - a.start + 1);
-        this.commitEnd = a.end;
+        a.end = a.start + newLines.length - 1;
+        // cumulative vs the rendered DOM, not vs the previous flush
+        this.lineDelta = a.end - a.domEnd;
+        this.commitEnd = a.domEnd;
+        this.staleShifted = true;
       }
-    } else {
-      this.lineDelta = 0;
-      this.commitEnd = Number.MAX_SAFE_INTEGER;
+      a.original = value;
     }
+    const keepSession =
+      !renderAfter && !forceClose && a.textarea.isConnected && document.activeElement === a.textarea;
+    if (keepSession) {
+      this.staleDom = this.staleDom || changed;
+      return changed;
+    }
+    this.active = null;
     if (renderAfter) this.rerenderKeepScroll();
     else this.staleDom = true;
     return changed;

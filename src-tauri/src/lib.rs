@@ -48,6 +48,16 @@ fn read_text(p: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// djb2-xor over UTF-8 bytes, hex-encoded — MUST stay identical to
+/// contentHash() in src/links.ts.
+fn djb2(s: &str) -> String {
+    let mut h: u32 = 5381;
+    for b in s.bytes() {
+        h = h.wrapping_mul(33) ^ (b as u32);
+    }
+    format!("{h:08x}")
+}
+
 fn walk(dir: &Path, rel: String, out: &mut Vec<String>) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for e in entries.flatten() {
@@ -117,22 +127,32 @@ async fn read_all_notes(root: String) -> Result<Vec<Note>, String> {
     Ok(notes)
 }
 
-/// Save a note. If the file changed on disk at all since `base_mtime` — newer
-/// OR older, since Dropbox can restore previous versions — nothing is written
-/// and the disk version is returned so the client can decide.
+/// Save a note. If the file changed on disk since the client loaded it,
+/// nothing is written and the disk version is returned so the client can
+/// decide. `base_hash` (content hash of what the client loaded) is the
+/// authoritative check — it catches Dropbox restoring older revisions and
+/// equal-mtime rewrites; `base_mtime` is the fallback when no hash is given.
+/// Omitting both forces the write.
 #[tauri::command]
 async fn write_note(
     root: String,
     path: String,
     content: String,
     base_mtime: Option<u64>,
+    base_hash: Option<String>,
 ) -> Result<SaveResult, String> {
     if !path.to_lowercase().ends_with(".md") {
         return Err("only .md files can be written".into());
     }
     let abs = safe_join(&root, &path)?;
-    if let Some(base) = base_mtime {
-        if abs.is_file() {
+    if abs.is_file() {
+        if let Some(hash) = &base_hash {
+            let disk = read_text(&abs)?;
+            if djb2(&disk) != *hash {
+                let mtime = mtime_ms(&abs)?;
+                return Ok(SaveResult::Conflict { content: disk, mtime });
+            }
+        } else if let Some(base) = base_mtime {
             let current = mtime_ms(&abs)?;
             if current.abs_diff(base) > 1 {
                 let disk = read_text(&abs)?;

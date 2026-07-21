@@ -33,23 +33,44 @@ export function normalizePath(path: string): string {
   return parts.join("/");
 }
 
-// Fence opener, allowing blockquote prefixes ("> ```") like markdown does.
-const FENCE_LINE_RE = /^\s*(?:>\s*)*(`{3,}|~{3,})/;
+// Fence opener: at most 3 spaces of indent (4+ is indented code, not a
+// fence), optionally behind blockquote prefixes ("> ```").
+const FENCE_LINE_RE = /^((?: {0,3}> ?)*) {0,3}(`{3,}|~{3,})/;
+const QUOTED_LINE_RE = /^ {0,3}>/;
+
+interface FenceState {
+  chars: string;
+  quoted: boolean;
+}
+
+/**
+ * Advance fence state by one line; reports whether the line belongs to a
+ * fence (opener, closer, or fenced content). A fence opened inside a
+ * blockquote ends when the blockquote does, like markdown renderers close it.
+ */
+function stepFence(line: string, fence: FenceState | null): { fence: FenceState | null; inFence: boolean } {
+  if (fence && fence.quoted && !QUOTED_LINE_RE.test(line)) {
+    fence = null; // the blockquote ended and took its fence with it
+  }
+  const fm = line.match(FENCE_LINE_RE);
+  if (fence) {
+    if (fm && fm[2][0] === fence.chars[0] && fm[2].length >= fence.chars.length) {
+      return { fence: null, inFence: true }; // closing line
+    }
+    return { fence, inFence: true };
+  }
+  if (fm) return { fence: { chars: fm[2], quoted: fm[1].length > 0 }, inFence: true };
+  return { fence: null, inFence: false };
+}
 
 /** Remove fenced code blocks and inline code spans so [links] inside them are ignored. */
 export function stripCode(src: string): string {
   const kept: string[] = [];
-  let fence: string | null = null;
+  let fence: FenceState | null = null;
   for (const line of src.split("\n")) {
-    const m = line.match(FENCE_LINE_RE);
-    if (fence) {
-      if (m && m[1][0] === fence[0] && m[1].length >= fence.length) fence = null;
-      continue;
-    }
-    if (m) {
-      fence = m[1];
-      continue;
-    }
+    const step = stepFence(line, fence);
+    fence = step.fence;
+    if (step.inFence) continue;
     kept.push(line.replace(/`[^`]*`/g, ""));
   }
   return kept.join("\n");
@@ -109,29 +130,29 @@ export function resolveLink(name: string, fromPath: string, allPaths: string[]):
   return candidates[0];
 }
 
-// Mirrors marked's GFM task detection — a space AND non-space content after
-// the bracket are required (marked: /^\[[ xX]\] +\S/), tasks may sit inside
-// blockquotes — plus one deliberate extension: an empty "[]" also counts as
-// an unchecked box (normalizeTasks hands marked the spec form). Checkbox N in
-// the rendered DOM must map to task line N here, so the renderer and the
-// toggler share this exact pattern.
-const TASK_RE = /^((?:\s*>)*\s*(?:[-*+]|\d+[.)])\s+\[)([ xX]?)(\] +(?=\S))/;
+// Mirrors marked's GFM task detection exactly — checkbox N in the rendered
+// DOM must map to task line N here, so the renderer and the toggler share
+// this pattern. Parity details that matter: ordered markers cap at 9 digits;
+// 1-4 spaces (or a tab) between marker and bracket, 5+ renders as code;
+// space-or-tab plus non-space content required after the bracket. One
+// deliberate extension: an empty "[]" also counts as an unchecked box
+// (normalizeTasks hands marked the spec form).
+const TASK_RE = /^((?:\s*>)*\s*(?:[-*+]|\d{1,9}[.)])(?: {1,4}|\t)\[)([ xX]?)(\][ \t]+(?=\S))/;
+
+/** Checked state of the task on a single line, or null if it's not a task line. */
+export function taskState(line: string): boolean | null {
+  const m = line.match(TASK_RE);
+  return m ? m[2].toLowerCase() === "x" : null;
+}
 
 /** Boolean per line: true when the line is prose, i.e. not part of a fenced code block. */
 function proseLineMask(lines: string[]): boolean[] {
   const mask: boolean[] = [];
-  let fence: string | null = null;
+  let fence: FenceState | null = null;
   for (const line of lines) {
-    const fm = line.match(FENCE_LINE_RE);
-    if (fence) {
-      mask.push(false);
-      if (fm && fm[1][0] === fence[0] && fm[1].length >= fence.length) fence = null;
-    } else if (fm) {
-      mask.push(false);
-      fence = fm[1];
-    } else {
-      mask.push(true);
-    }
+    const step = stepFence(line, fence);
+    fence = step.fence;
+    mask.push(!step.inFence);
   }
   return mask;
 }
@@ -172,6 +193,17 @@ export function toggleTaskAtLine(src: string, line: number): string | null {
     (_, pre, mark, post) => pre + (mark === "x" || mark === "X" ? " " : "x") + post,
   );
   return lines.join("\n");
+}
+
+/**
+ * djb2-xor over UTF-8 bytes, hex-encoded. Used to detect on-disk changes
+ * regardless of mtime games — MUST stay identical to djb2() in
+ * src-tauri/src/lib.rs.
+ */
+export function contentHash(s: string): string {
+  let h = 5381 >>> 0;
+  for (const b of new TextEncoder().encode(s)) h = (Math.imul(h, 33) ^ b) >>> 0;
+  return h.toString(16).padStart(8, "0");
 }
 
 export function todayName(d = new Date()): string {

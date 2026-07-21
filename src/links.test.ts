@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import {
+  contentHash,
   extractLinks,
   normalizePath,
   normalizeTasks,
   resolveLink,
   taskLinesIn,
+  taskState,
   todayName,
   toggleTaskAtLine,
 } from "./links";
@@ -115,6 +117,38 @@ describe("task line detection", () => {
   test("skips fake tasks inside blockquoted code fences", () => {
     const s = "> ```\n> - [ ] in code\n> ```\n\n- [ ] real";
     expect(taskLinesIn(s, 0, 4)).toEqual([4]);
+  });
+
+  test("a quoted fence ends with its blockquote, like marked closes it", () => {
+    expect(taskLinesIn("> ```\n\n- [ ] a\n- [ ] b", 0, 3)).toEqual([2, 3]);
+  });
+
+  test("4-space-indented backticks are indented code, not a fence", () => {
+    expect(taskLinesIn("    ```\n- [ ] real", 0, 1)).toEqual([1]);
+  });
+
+  test("marked parity: tab after bracket counts, huge markers and wide gaps don't", () => {
+    expect(taskLinesIn("- [x]\tdone", 0, 0)).toEqual([0]);
+    expect(taskLinesIn("1234567890. [ ] ten-digit marker", 0, 0)).toEqual([]);
+    expect(taskLinesIn("-     [ ] five-space gap", 0, 0)).toEqual([]);
+  });
+});
+
+describe("taskState", () => {
+  test("reports checked, unchecked, and non-task lines", () => {
+    expect(taskState("- [x] done")).toBe(true);
+    expect(taskState("- [ ] open")).toBe(false);
+    expect(taskState("- [] shorthand")).toBe(false);
+    expect(taskState("plain text")).toBeNull();
+  });
+});
+
+describe("contentHash", () => {
+  test("is stable and content-sensitive", () => {
+    expect(contentHash("")).toBe("00001505");
+    expect(contentHash("hello")).toBe(contentHash("hello"));
+    expect(contentHash("hello")).not.toBe(contentHash("hello!"));
+    expect(contentHash("æøå")).toHaveLength(8);
   });
 });
 

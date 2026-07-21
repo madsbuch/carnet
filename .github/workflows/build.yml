@@ -1,0 +1,116 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun test
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: bun install --frozen-lockfile
+      # universal binary: one .dmg that runs on Apple Silicon and Intel
+      - run: bun tauri build --target universal-apple-darwin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carnet-macos
+          path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - name: Install NDK
+        run: |
+          sdkmanager "ndk;27.2.12479018"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: bun install --frozen-lockfile
+      - name: Generate Android project
+        run: bun tauri android init
+      - name: Add storage permissions to the Android manifest
+        # The generated project is not committed, so the vault's all-files
+        # access has to be re-applied on every build.
+        run: |
+          python3 - <<'EOF'
+          from pathlib import Path
+          p = Path("src-tauri/gen/android/app/src/main/AndroidManifest.xml")
+          xml = p.read_text()
+          perms = (
+              '    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />\n'
+              '    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />\n'
+              '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />\n'
+          )
+          assert "<application" in xml, "unexpected manifest layout"
+          if "MANAGE_EXTERNAL_STORAGE" not in xml:
+              xml = xml.replace("<application", perms + "    <application", 1)
+          p.write_text(xml)
+          print(xml)
+          EOF
+      - name: Build APK
+        run: bun tauri android build --apk
+      - name: Sign APK
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME/build-tools/"* | sort -V | tail -1)
+          APK=$(ls src-tauri/gen/android/app/build/outputs/apk/universal/release/*.apk | head -1)
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > ci-keystore.jks
+            PASS="$KEYSTORE_PASSWORD"
+            ALIAS="${KEY_ALIAS:-carnet}"
+          else
+            # no signing secrets: use a throwaway key so the APK still installs;
+            # the signature changes every run, so updates need a reinstall
+            keytool -genkeypair -keystore ci-keystore.jks -alias carnet \
+              -storepass carnet-ci -keypass carnet-ci -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname "CN=Carnet CI"
+            PASS="carnet-ci"
+            ALIAS="carnet"
+            echo "::notice::APK signed with a throwaway key — add ANDROID_KEYSTORE_B64 / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_ALIAS secrets for a stable signature (see README)"
+          fi
+          "$BUILD_TOOLS/zipalign" -f 4 "$APK" carnet-aligned.apk
+          "$BUILD_TOOLS/apksigner" sign --ks ci-keystore.jks --ks-pass "pass:$PASS" \
+            --ks-key-alias "$ALIAS" --key-pass "pass:$PASS" \
+            --out carnet.apk carnet-aligned.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carnet-android
+          path: carnet.apk
+          if-no-files-found: error

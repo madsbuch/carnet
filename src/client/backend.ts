@@ -50,8 +50,14 @@ export const readNote = (path: string) => invoke<Note | null>("read_note", { roo
 
 export const readAllNotes = () => invoke<Note[]>("read_all_notes", { root: must() });
 
-export const writeNote = (path: string, content: string, baseMtime?: number) =>
-  invoke<SaveResult>("write_note", { root: must(), path, content, baseMtime: baseMtime ?? null });
+export const writeNote = (path: string, content: string, baseMtime?: number, baseHash?: string) =>
+  invoke<SaveResult>("write_note", {
+    root: must(),
+    path,
+    content,
+    baseMtime: baseMtime ?? null,
+    baseHash: baseHash ?? null,
+  });
 
 /** URL usable in <img src> for a file inside the vault. */
 export const assetUrl = (rel: string) => convertFileSrc(must() + "/" + rel);

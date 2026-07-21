@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { convertBlock, nextItemPrefix, segmentBlocks, stripBlockPrefixes, type Block } from "./blocks";
+import {
+  convertBlock,
+  itemContentStart,
+  nextItemPrefix,
+  segmentBlocks,
+  stripBlockPrefixes,
+  type Block,
+} from "./blocks";
 
 /** Blocks must tile the source exactly — that's what makes line-splice edits safe. */
 function expectTiling(src: string) {
@@ -114,6 +121,17 @@ describe("convertBlock / stripBlockPrefixes", () => {
 
   test("setext heading strips to its text", () => {
     expect(stripBlockPrefixes("Title\n---")).toBe("Title");
+  });
+});
+
+describe("itemContentStart", () => {
+  test("finds where item text begins, past marker and task box", () => {
+    expect(itemContentStart("- foo")).toBe(2);
+    expect(itemContentStart("- [ ] foo")).toBe(6);
+    expect(itemContentStart("- [] foo")).toBe(5);
+    expect(itemContentStart("  3. [x] bar")).toBe(9);
+    expect(itemContentStart("plain text")).toBe(0);
+    expect(itemContentStart("- multi\n  line")).toBe(2);
   });
 });
 

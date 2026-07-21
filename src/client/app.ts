@@ -1,7 +1,7 @@
 import { ask } from "@tauri-apps/plugin-dialog";
 import { homeDir } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { basename, DAILY_RE, dirOf, normalizePath, noteTitle, resolveLink } from "../links";
+import { basename, contentHash, DAILY_RE, dirOf, normalizePath, noteTitle, resolveLink } from "../links";
 import { buildGraph, dailyPath, searchNotes, type GraphData } from "../graph-data";
 import * as backend from "./backend";
 import { BlockView } from "./blockview";
@@ -23,6 +23,8 @@ const setupPath = $<HTMLInputElement>("#setup-path");
 
 let paths: string[] = [];
 let note: backend.Note | null = null;
+/** Hash of the current note's content as last seen on disk (conflict detection). */
+let loadedHash: string | null = null;
 let dirty = false;
 let editing = false; // raw source mode; block editing lives in blockView
 let allNotesCache: backend.Note[] | null = null;
@@ -119,7 +121,7 @@ async function doSave(): Promise<void> {
   const n = note;
   const contentAtSave = n.content;
   try {
-    let res = await backend.writeNote(n.path, contentAtSave, n.mtime);
+    let res = await backend.writeNote(n.path, contentAtSave, n.mtime, loadedHash ?? undefined);
     if (res.status === "conflict") {
       const keepMine = await ask(
         "This note changed on disk — probably synced from another device. Which version should win?",
@@ -131,6 +133,7 @@ async function doSave(): Promise<void> {
         n.content = res.content;
         n.mtime = res.mtime;
         if (note === n) {
+          loadedHash = contentHash(res.content);
           dirty = false;
           updateDirty();
           if (editing) editorEl.value = n.content;
@@ -140,7 +143,10 @@ async function doSave(): Promise<void> {
         return;
       }
     }
-    if (res.status === "ok") n.mtime = res.mtime;
+    if (res.status === "ok") {
+      n.mtime = res.mtime;
+      if (note === n) loadedHash = contentHash(contentAtSave);
+    }
     if (note === n && n.content === contentAtSave) {
       dirty = false;
       updateDirty();
@@ -190,7 +196,7 @@ async function loadNote(path: string): Promise<void> {
     renderTree();
     return;
   }
-  blockView.commit(false);
+  blockView.flush(); // end any edit session — it must not survive into another note
   const seq = ++loadSeq;
   await save();
   if (seq !== loadSeq) return;
@@ -199,19 +205,25 @@ async function loadNote(path: string): Promise<void> {
     if (seq !== loadSeq) return;
     let created = false;
     if (!n) {
-      const res = await backend.writeNote(path, "");
+      // baseMtime 0: if the file appears concurrently (Dropbox sync), the
+      // write conflicts instead of wiping it — then adopt the disk version
+      const res = await backend.writeNote(path, "", 0);
       if (seq !== loadSeq) return;
-      if (res.status !== "ok") throw new Error("could not create note");
-      n = { path, content: "", mtime: res.mtime };
-      created = true;
+      if (res.status === "conflict") {
+        n = { path, content: res.content, mtime: res.mtime };
+      } else {
+        n = { path, content: "", mtime: res.mtime };
+        created = true;
+        toast("Created " + path);
+      }
       if (!paths.includes(path)) {
         paths.push(path);
         paths.sort();
       }
       invalidate();
-      toast("Created " + path);
     }
     note = n;
+    loadedHash = contentHash(n.content);
     dirty = false;
     editing = false;
     addRecent(path);
@@ -301,7 +313,7 @@ function autoSize(): void {
 
 function showEditor(): void {
   if (!note) return;
-  blockView.commit(false);
+  blockView.flush(); // source mode replaces the block session entirely
   editing = true;
   editorEl.value = note.content;
   previewEl.hidden = true;
@@ -470,11 +482,13 @@ function updateQuickOpen(q: string): void {
           (h) => h.snippet !== null && !qoItems.some((it) => it.path === h.path),
         );
         if (qoInput.value.trim() !== q || qoEl.hidden) return;
+        const selected = qoItems[qoSel]; // late results must not move the selection
         const createIdx = qoItems.findIndex((it) => it.create !== undefined);
         const extra = hits.map((h) => ({ path: h.path, snippet: h.snippet ?? undefined }));
         if (createIdx >= 0) qoItems.splice(createIdx, 0, ...extra);
         else qoItems.push(...extra);
-        renderQoItems(qoSel);
+        const keep = selected ? qoItems.indexOf(selected) : 0;
+        renderQoItems(keep >= 0 ? keep : 0);
       } catch {
         /* vault unreadable; leave filename matches */
       }
@@ -563,6 +577,7 @@ async function refreshFromDisk(): Promise<void> {
   if (!fresh || note !== before || dirty || blockView.hasActiveEdit()) return;
   if (fresh.mtime !== note.mtime) {
     note = fresh;
+    loadedHash = contentHash(fresh.content);
     if (editing) editorEl.value = fresh.content;
     else renderPreview();
     toast("Updated from disk");
@@ -599,7 +614,7 @@ async function finishSetup(): Promise<void> {
 }
 
 async function changeVault(): Promise<void> {
-  blockView.commit(false);
+  blockView.flush();
   await save();
   closeSidebar();
   graphView.hide();
@@ -709,7 +724,7 @@ window.addEventListener("hashchange", () => {
 // flush the last edits before the window closes (Cmd+Q, red button)
 void getCurrentWindow()
   .onCloseRequested(async () => {
-    blockView.commit(false);
+    blockView.flush();
     await save();
   })
   .catch(() => {});

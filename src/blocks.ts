@@ -23,10 +23,11 @@ export interface Block {
 const LIST_RE = /^(\s*)([-*+]|\d{1,9}[.)])(\s+)(.*)$/;
 const HEADING_RE = /^ {0,3}#{1,6}\s/;
 const HR_RE = /^ {0,3}(?:(?:-[ \t]*){3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})$/;
-const FENCE_RE = /^\s*(`{3,}|~{3,})/;
+// max 3 spaces of indent — 4+ is indented code, not a fence (CommonMark)
+const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
 const QUOTE_RE = /^ {0,3}>/;
 const SETEXT_RE = /^ {0,3}(=+|-+)\s*$/;
-const TASK_MARK_RE = /^\[([ xX]?)\] /;
+const TASK_MARK_RE = /^\[([ xX]?)\][ \t]+/;
 
 function leadingWidth(line: string): number {
   let c = 0;
@@ -200,6 +201,17 @@ export function convertBlock(text: string, target: TargetType): string {
     case "task":
       return lines.map((l, i) => (i === 0 ? `- [ ] ${l}` : l.trim() === "" ? l : `  ${l}`)).join("\n");
   }
+}
+
+/** Column where an item line's text content starts (after marker and task box). */
+export function itemContentStart(text: string): number {
+  const firstLine = text.includes("\n") ? text.slice(0, text.indexOf("\n")) : text;
+  const lm = firstLine.match(LIST_RE);
+  if (!lm) return 0;
+  let w = lm[1].length + lm[2].length + lm[3].length;
+  const tm = lm[4].match(TASK_MARK_RE);
+  if (tm) w += tm[0].length;
+  return w;
 }
 
 /** The line prefix a new sibling of this item should get ("- ", "3. ", "- [ ] "…). */
