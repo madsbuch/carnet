@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Carnet</title>
+<link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+
+<header id="topbar">
+  <button id="btn-menu" class="icon" title="Files (b)" aria-label="Files">
+    <svg viewBox="0 0 20 20"><path d="M3 5h14M3 10h14M3 15h14"/></svg>
+  </button>
+  <div id="title"><span id="note-title">Carnet</span><span id="dirty-dot" hidden>&#9679;</span></div>
+  <div id="actions">
+    <button id="btn-today" class="icon" title="Today's note (t)" aria-label="Today">
+      <svg viewBox="0 0 20 20"><rect x="3" y="4" width="14" height="13" rx="2"/><path d="M3 8h14M7 2v4M13 2v4"/></svg>
+    </button>
+    <button id="btn-search" class="icon" title="Search (&#8984;K or /)" aria-label="Search">
+      <svg viewBox="0 0 20 20"><circle cx="9" cy="9" r="5.5"/><path d="M13.5 13.5L17 17"/></svg>
+    </button>
+    <button id="btn-graph" class="icon" title="Graph (g)" aria-label="Graph">
+      <svg viewBox="0 0 20 20"><circle cx="5" cy="15" r="2.5"/><circle cx="15" cy="14" r="2.5"/><circle cx="10" cy="5" r="2.5"/><path d="M7 13.5L8.7 7M11.4 6.8L13.8 12M7.5 15l5-.6"/></svg>
+    </button>
+    <button id="btn-edit" class="icon" title="Edit (e)" aria-label="Edit">
+      <svg id="ic-edit" viewBox="0 0 20 20"><path d="M12.5 4.5l3 3L7 16H4v-3z"/></svg>
+      <svg id="ic-done" viewBox="0 0 20 20" hidden><path d="M4 10.5l4 4L16 6"/></svg>
+    </button>
+  </div>
+</header>
+
+<nav id="sidebar">
+  <div id="tree"></div>
+  <button id="btn-new">+ New note</button>
+  <button id="btn-vault">Change notes folder&hellip;</button>
+</nav>
+<div id="backdrop" hidden></div>
+
+<main id="main">
+  <article id="preview" class="markdown"></article>
+  <textarea id="editor" hidden spellcheck="false" autocapitalize="sentences"></textarea>
+  <section id="backlinks" hidden>
+    <h4>Linked from</h4>
+    <ul></ul>
+  </section>
+</main>
+
+<div id="quickopen" hidden>
+  <div id="qo-panel">
+    <input id="qo-input" type="text" placeholder="Open or create a note&hellip;" autocomplete="off" />
+    <ul id="qo-list"></ul>
+    <div id="qo-hint"><kbd>&#8593;&#8595;</kbd> navigate &nbsp; <kbd>&#9166;</kbd> open &nbsp; <kbd>esc</kbd> close</div>
+  </div>
+</div>
+
+<div id="graphview" hidden>
+  <canvas id="graph-canvas"></canvas>
+  <button id="graph-close" class="icon" title="Close (esc)" aria-label="Close graph">
+    <svg viewBox="0 0 20 20"><path d="M5 5l10 10M15 5L5 15"/></svg>
+  </button>
+</div>
+
+<div id="setup" hidden>
+  <div id="setup-panel">
+    <h2>Carnet</h2>
+    <p>Point Carnet at the folder that holds your markdown notes &mdash; typically your Dropbox folder. Files stay where they are; Dropbox keeps doing the syncing.</p>
+    <div id="setup-row">
+      <input id="setup-path" type="text" placeholder="/Users/you/Dropbox" autocomplete="off" spellcheck="false" />
+      <button id="setup-browse">Browse&hellip;</button>
+    </div>
+    <button id="setup-go">Open notes</button>
+    <p class="hint">On Android: sync your Dropbox to local storage with an app like FolderSync, then enter that folder here (e.g. /storage/emulated/0/Dropbox).</p>
+  </div>
+</div>
+
+<div id="toast" hidden></div>
+
+<script type="module" src="./app.ts"></script>
+</body>
+</html>
