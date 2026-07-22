@@ -1,5 +1,6 @@
 // Thin adapter over the Tauri IPC commands. All file access happens in Rust.
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { appLocalDataDir } from "@tauri-apps/api/path";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
@@ -73,5 +74,17 @@ export const writeNote = (path: string, content: string, baseMtime?: number, bas
 
 /** URL usable in <img src> for a file inside the vault. */
 export const assetUrl = (rel: string) => convertFileSrc(must() + "/" + rel);
+
+/** Remove a note from the vault (used to mirror remote Dropbox deletions). */
+export const deleteNote = (path: string) => invoke<void>("delete_note", { root: must(), path });
+
+/** Create a directory (and parents) if it doesn't exist. */
+export const ensureDir = (root: string) => invoke<void>("ensure_dir", { root });
+
+/** Absolute path to the app-private folder that holds the Dropbox mirror. */
+export async function dropboxMirrorDir(): Promise<string> {
+  const base = (await appLocalDataDir()).replace(/\/$/, "");
+  return base + "/dropbox-vault";
+}
 
 export { openUrl };
