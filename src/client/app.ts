@@ -4,6 +4,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { basename, contentHash, DAILY_RE, dirOf, fuzzyScore, normalizePath, noteTitle, resolveLink } from "../links";
 import { buildGraph, dailyPath, searchNotes, type GraphData } from "../graph-data";
 import * as backend from "./backend";
+import * as dropbox from "./dropboxmode";
+import type { DropboxSync } from "./dropboxsync";
 import { BlockView } from "./blockview";
 import { GraphView } from "./graph";
 import { setupLinkComplete } from "./linkcomplete";
@@ -39,6 +41,9 @@ let lastNoteHash = "";
 let started = false;
 let loadSeq = 0;
 const openDirs = new Set<string>();
+
+/** Real-time Dropbox engine, when running (Android only). Null in folder mode. */
+let dropboxSync: DropboxSync | null = null;
 
 function safeDecode(s: string): string {
   try {
@@ -158,8 +163,40 @@ async function doSave(): Promise<void> {
       updateDirty();
     }
     invalidate();
+    await pushToDropbox(n, contentAtSave);
   } catch (e) {
     toast("Save failed: " + e);
+  }
+}
+
+/** In Dropbox mode, push a saved note upstream. A rev conflict (the note also
+ *  changed on Dropbox) reuses the same keep-mine / take-theirs choice as the
+ *  on-disk conflict path. */
+async function pushToDropbox(n: backend.Note, contentAtSave: string): Promise<void> {
+  if (!dropboxSync) return;
+  try {
+    const push = await dropboxSync.pushNote(n.path, contentAtSave);
+    if (push.status !== "conflict") return;
+    const keepMine = await ask(
+      "This note also changed in Dropbox. Which version should win?",
+      { title: "Note changed in Dropbox", okLabel: "Keep mine", cancelLabel: "Load Dropbox version" },
+    );
+    if (keepMine) {
+      await backend.writeNote(n.path, contentAtSave); // mirror = mine
+      await dropboxSync.pushNote(n.path, contentAtSave); // upload wins the rev now
+    } else if (note === n) {
+      n.content = push.content;
+      const fresh = await backend.readNote(n.path).catch(() => null);
+      if (fresh) n.mtime = fresh.mtime;
+      loadedHash = contentHash(push.content);
+      dirty = false;
+      updateDirty();
+      if (editing) editorEl.value = n.content;
+      else renderPreview();
+      invalidate();
+    }
+  } catch (e) {
+    toast("Dropbox upload failed: " + e);
   }
 }
 
@@ -650,6 +687,7 @@ async function showSetup(): Promise<void> {
       "Notes are markdown files in a folder on this phone — typically a synced copy of your Dropbox. Two things to set up first:";
     setupStepsEl.hidden = false;
     $<HTMLElement>("#setup-browse").hidden = true; // no folder picker on Android
+    $<HTMLElement>("#setup-dropbox").hidden = false; // offer real-time Dropbox
     setupPath.placeholder = "/storage/emulated/0/Dropbox";
     void refreshSetupChecks();
     return;
@@ -689,6 +727,11 @@ async function changeVault(): Promise<void> {
   closeSidebar();
   closeQuickOpen();
   graphView.hide();
+  if (dropboxSync) {
+    dropboxSync.stop();
+    dropboxSync = null;
+    dropbox.disconnect();
+  }
   backend.clearVault();
   started = false;
   note = null;
@@ -734,6 +777,33 @@ $("#setup-sync-btn").addEventListener("click", () => {
     .openUrl("https://play.google.com/store/search?q=dropbox%20sync&c=apps")
     .catch((err) => toast(String(err)));
 });
+
+$("#setup-dropbox-connect").addEventListener("click", () => {
+  const key = $<HTMLInputElement>("#setup-dropbox-key").value.trim();
+  if (!key) {
+    toast("Enter your Dropbox app key first");
+    return;
+  }
+  void dropbox.beginAuth(key).catch((e) => toast("Couldn't open Dropbox: " + e));
+});
+
+$("#setup-dropbox-finish").addEventListener("click", () => void finishDropbox());
+
+async function finishDropbox(): Promise<void> {
+  const code = $<HTMLInputElement>("#setup-dropbox-code").value.trim();
+  if (!code) {
+    toast("Paste the code from Dropbox first");
+    return;
+  }
+  try {
+    await dropbox.completeAuth(code);
+    await startDropboxMode();
+    setupEl.hidden = true;
+    await startApp();
+  } catch (e) {
+    toast("Dropbox connect failed: " + e);
+  }
+}
 
 editorEl.addEventListener("input", () => {
   if (!note) return;
@@ -830,6 +900,18 @@ async function startApp(): Promise<void> {
   route();
 }
 
+/** Start the real-time Dropbox engine and point the vault at the local mirror.
+ *  Remote changes refresh the open note + tree through the normal path. */
+async function startDropboxMode(): Promise<void> {
+  dropboxSync = await dropbox.start({
+    onChanged: () => {
+      invalidate();
+      void refreshFromDisk();
+    },
+    onError: (m) => toast(m),
+  });
+}
+
 async function boot(): Promise<void> {
   setupWiki();
   void applySafeArea();
@@ -838,6 +920,16 @@ async function boot(): Promise<void> {
     currentPath: () => note?.path ?? null,
     recents,
   });
+  if (IS_ANDROID && dropbox.isConnected()) {
+    try {
+      await startDropboxMode();
+      await startApp();
+      return;
+    } catch (e) {
+      toast("Dropbox sync failed to start: " + e);
+      // fall back to folder setup below
+    }
+  }
   const root = backend.vaultRoot();
   if (root && (await backend.vaultValid(root).catch(() => false))) {
     await startApp();

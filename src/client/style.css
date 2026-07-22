@@ -464,6 +464,39 @@ body.sidebar-open #sidebar { transform: none; }
 #setup-browse { background: var(--code-bg); color: var(--fg); }
 #setup-go { background: var(--accent); color: #fff; width: 100%; }
 
+/* Android: the direct-Dropbox real-time option below the folder path. */
+#setup-dropbox { margin-top: 18px; }
+#setup-dropbox .setup-or {
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+  margin: 6px 0 12px;
+}
+#setup-dropbox .step-title { font-weight: 600; margin-bottom: 4px; }
+#setup-dropbox code { font-size: 12px; }
+#setup-dropbox-key,
+#setup-dropbox-code {
+  width: 100%;
+  margin: 8px 0;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--fg);
+  font: 14px ui-monospace, "SF Mono", Menlo, monospace;
+}
+#setup-dropbox-finish {
+  width: 100%;
+  padding: 9px 14px;
+  border: none;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 14px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+}
+
 /* Android onboarding checklist: numbered circles that turn into accent
    checkmarks; a finished step collapses to just its title. */
 #setup-steps {

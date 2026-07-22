@@ -92,6 +92,25 @@ ticks each step off as it's done. Two notes on what's behind that:
    agnostic to which app you pick: it offers any top-level storage folder that holds
    markdown files.
 
+### Real-time Dropbox sync (Android)
+
+Folder-sync apps poll on an interval (FolderSync's default is 15 minutes), so a note edited
+on another device can take that long to show up. On Android the setup screen offers a second
+option — **connect Dropbox directly** — that skips the sync app entirely: Carnet keeps a local
+mirror of your Dropbox folder and uses Dropbox's long-poll API to pull changes within seconds,
+pushing your own saves straight back. Desktop is unaffected and still uses a plain folder (the
+Dropbox client there is already near-instant).
+
+To use it you supply your own Dropbox **app key** (one-time, so the app isn't tied to a shared
+key): create a [Scoped app](https://www.dropbox.com/developers/apps) with the
+`files.content.read` and `files.content.write` scopes, paste the key into the setup screen, and
+authorize. Auth is OAuth2 with PKCE and no redirect — Dropbox shows a code you paste back — so
+there's no server and no secret. The refresh token is stored on-device; only `.md` notes sync
+(attachments still ride whatever folder sync you have). Under the hood this is
+[`src/client/dropbox.ts`](src/client/dropbox.ts) (API client) and
+[`dropboxsync.ts`](src/client/dropboxsync.ts) (the pull/push engine), both unit-tested in
+[`src/dropbox.test.ts`](src/dropbox.test.ts).
+
 ## CI builds
 
 Every push to `main` runs [.github/workflows/build.yml](.github/workflows/build.yml): tests, a

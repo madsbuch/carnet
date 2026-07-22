@@ -98,6 +98,21 @@
       <button id="setup-browse">Browse&hellip;</button>
     </div>
     <button id="setup-go">Open notes</button>
+
+    <!-- Android only: connect Dropbox directly for real-time sync, instead of
+         relying on a folder-sync app's polling interval. -->
+    <div id="setup-dropbox" hidden>
+      <div class="setup-or">or</div>
+      <div class="step-title">Real-time sync (connect Dropbox)</div>
+      <p>Skip the folder-sync app: let Carnet talk to Dropbox directly so changes
+        appear within seconds. Paste your Dropbox app key (create one at
+        dropbox.com/developers, Scoped app, with <code>files.content.read</code>
+        and <code>files.content.write</code>), then authorize.</p>
+      <input id="setup-dropbox-key" type="text" placeholder="Dropbox app key" autocomplete="off" spellcheck="false" />
+      <button id="setup-dropbox-connect" class="step-btn">Authorize Dropbox&hellip;</button>
+      <input id="setup-dropbox-code" type="text" placeholder="Paste the code from Dropbox" autocomplete="off" spellcheck="false" />
+      <button id="setup-dropbox-finish">Finish &amp; sync</button>
+    </div>
   </div>
 </div>
 

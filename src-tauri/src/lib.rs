@@ -178,6 +178,29 @@ async fn write_note(
     Ok(SaveResult::Ok { mtime: mtime_ms(&abs)? })
 }
 
+/// Delete a note from the vault. Used by the real-time Dropbox backend to
+/// mirror a remote deletion locally. Missing files are a no-op so applying the
+/// same delta twice is harmless.
+#[tauri::command]
+async fn delete_note(root: String, path: String) -> Result<(), String> {
+    if !path.to_lowercase().ends_with(".md") {
+        return Err("only .md files can be deleted".into());
+    }
+    let abs = safe_join(&root, &path)?;
+    match fs::remove_file(&abs) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Make sure a directory exists, creating it (and parents) if needed. The
+/// Dropbox mirror lives in app-local data, which may not exist on first run.
+#[tauri::command]
+async fn ensure_dir(root: String) -> Result<(), String> {
+    fs::create_dir_all(&root).map_err(|e| e.to_string())
+}
+
 /// Android glue for the "All files access" permission the vault needs.
 /// Everything JNI runs on the Android main thread via wry's dispatch; a
 /// channel hands the result back to the (async) command thread.
@@ -429,6 +452,8 @@ pub fn run() {
             read_note,
             read_all_notes,
             write_note,
+            delete_note,
+            ensure_dir,
             safe_area_insets,
             storage_ready,
             request_storage_access,
