@@ -107,6 +107,32 @@ export function extractLinks(src: string): string[] {
 }
 
 /**
+ * Subsequence fuzzy match of query against a path: higher is better, -1 means
+ * no match. Rewards streaks, word starts, and title prefixes — shared by quick
+ * open and the wiki-link type-ahead.
+ */
+export function fuzzyScore(query: string, path: string): number {
+  const q = query.toLowerCase();
+  const s = path.toLowerCase();
+  let qi = 0;
+  let streak = 0;
+  let score = 0;
+  for (let i = 0; i < s.length && qi < q.length; i++) {
+    if (s[i] === q[qi]) {
+      qi++;
+      streak++;
+      score += 1 + streak;
+      if (i === 0 || "/-_ .".includes(s[i - 1])) score += 6;
+    } else {
+      streak = 0;
+    }
+  }
+  if (qi < q.length) return -1;
+  if (basename(s).startsWith(q)) score += 20;
+  return score - s.length * 0.01;
+}
+
+/**
  * Resolve a wiki link name to a vault path.
  * [name] matches name.md anywhere in the vault (case-insensitive); when several
  * match, prefer the one in the same folder as the linking note, then the

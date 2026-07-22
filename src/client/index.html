@@ -31,9 +31,13 @@
 </header>
 
 <nav id="sidebar">
-  <div id="tree"></div>
-  <button id="btn-new">+ New note</button>
-  <button id="btn-vault">Change notes folder&hellip;</button>
+  <!-- On phones #library moves into the quick-open overlay (one full-screen
+       surface for browse + search); on desktop it stays in this drawer. -->
+  <div id="library">
+    <div id="tree"></div>
+    <button id="btn-new">+ New note</button>
+    <button id="btn-vault">Change notes folder&hellip;</button>
+  </div>
 </nav>
 <div id="backdrop" hidden></div>
 
@@ -48,8 +52,14 @@
 
 <div id="quickopen" hidden>
   <div id="qo-panel">
-    <input id="qo-input" type="text" placeholder="Open or create a note&hellip;" autocomplete="off" />
+    <div id="qo-top">
+      <input id="qo-input" type="text" placeholder="Open or create a note&hellip;" autocomplete="off" />
+      <button id="qo-close" class="icon" title="Close (esc)" aria-label="Close">
+        <svg viewBox="0 0 20 20"><path d="M5 5l10 10M15 5L5 15"/></svg>
+      </button>
+    </div>
     <ul id="qo-list"></ul>
+    <div id="qo-browse" hidden></div>
     <div id="qo-hint"><kbd>&#8593;&#8595;</kbd> navigate &nbsp; <kbd>&#9166;</kbd> open &nbsp; <kbd>esc</kbd> close</div>
   </div>
 </div>

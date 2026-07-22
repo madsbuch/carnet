@@ -9,7 +9,8 @@ directly. There is no server and no database; Dropbox does all the syncing.
 - **`[wiki-links]`** — writing `[some-name]` links to `some-name.md` anywhere in the folder
   tree (same folder as the current note wins if there are several). Clicking a link that
   doesn't resolve creates the file next to the current note. `[projects/carnet]` addresses an
-  exact path from the root.
+  exact path from the root. Typing `[` in any editor pops a fuzzy type-ahead over your notes;
+  picking one completes the link.
 - **Graph** — a force-directed graph of every link between notes, colored by top-level
   folder. Notes that are linked but don't exist yet show up gray. Click a node to open it.
 - **Daily notes** — `yyyy-MM-dd.md`. Carnet opens today's note on launch (creating it in the
@@ -23,7 +24,9 @@ directly. There is no server and no database; Dropbox does all the syncing.
   synced from another device you choose which version wins.
 
 The interface is one page: the note, four buttons, a file tree behind the hamburger. Purpose
-lives in file names (`projects/carnet/carnet-tasks.md`), not in menus.
+lives in file names (`projects/carnet/carnet-tasks.md`), not in menus. On phone-sized
+screens the hamburger opens a full-screen files view instead — search on top, the tree
+below — since a drawer is cramped there.
 
 ## Keyboard
 

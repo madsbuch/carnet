@@ -39,6 +39,9 @@ export async function browseForVault(): Promise<string | null> {
   return typeof picked === "string" ? picked : null;
 }
 
+/** Android: system bar insets in CSS px (webview draws edge-to-edge there). */
+export const safeAreaInsets = () => invoke<{ top: number; bottom: number }>("safe_area_insets");
+
 /** Android: is "All files access" granted? Always true on desktop. */
 export const storageReady = () => invoke<boolean>("storage_ready");
 

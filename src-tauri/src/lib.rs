@@ -221,6 +221,55 @@ mod android {
         .unwrap_or_else(|_| std::fs::read_dir("/storage/emulated/0").is_ok())
     }
 
+    /// Status/navigation bar heights in CSS pixels. The webview draws
+    /// edge-to-edge on Android and env(safe-area-inset-*) stays 0 there, so
+    /// the UI asks the window directly.
+    pub fn safe_area_insets() -> Result<(f64, f64), String> {
+        on_android_context(|env, activity| {
+            let window = env
+                .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?
+                .l()?;
+            let decor = env
+                .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
+                .l()?;
+            let insets = env
+                .call_method(
+                    &decor,
+                    "getRootWindowInsets",
+                    "()Landroid/view/WindowInsets;",
+                    &[],
+                )?
+                .l()?;
+            if insets.is_null() {
+                return Ok((0.0, 0.0));
+            }
+            let top = env
+                .call_method(&insets, "getSystemWindowInsetTop", "()I", &[])?
+                .i()? as f64;
+            let bottom = env
+                .call_method(&insets, "getSystemWindowInsetBottom", "()I", &[])?
+                .i()? as f64;
+            let res = env
+                .call_method(
+                    activity,
+                    "getResources",
+                    "()Landroid/content/res/Resources;",
+                    &[],
+                )?
+                .l()?;
+            let dm = env
+                .call_method(
+                    &res,
+                    "getDisplayMetrics",
+                    "()Landroid/util/DisplayMetrics;",
+                    &[],
+                )?
+                .l()?;
+            let density = env.get_field(&dm, "density", "F")?.f()? as f64;
+            Ok((top / density, bottom / density))
+        })
+    }
+
     /// Open the system screen where the user flips "All files access" on —
     /// Carnet's own screen when the device resolves it, the global list
     /// otherwise (some OEMs don't handle the per-app intent).
@@ -275,6 +324,24 @@ mod android {
             Ok(())
         })
     }
+}
+
+#[derive(Serialize)]
+pub struct SafeArea {
+    top: f64,
+    bottom: f64,
+}
+
+/// System bar insets in CSS pixels; zero anywhere but Android.
+#[tauri::command]
+async fn safe_area_insets() -> SafeArea {
+    #[cfg(target_os = "android")]
+    {
+        let (top, bottom) = android::safe_area_insets().unwrap_or((0.0, 0.0));
+        return SafeArea { top, bottom };
+    }
+    #[cfg(not(target_os = "android"))]
+    SafeArea { top: 0.0, bottom: 0.0 }
 }
 
 /// Whether the app is allowed to read the phone's shared storage.
@@ -362,6 +429,7 @@ pub fn run() {
             read_note,
             read_all_notes,
             write_note,
+            safe_area_insets,
             storage_ready,
             request_storage_access,
             find_vault_candidates

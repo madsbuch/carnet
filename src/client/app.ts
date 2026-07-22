@@ -1,11 +1,12 @@
 import { ask } from "@tauri-apps/plugin-dialog";
 import { homeDir } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { basename, contentHash, DAILY_RE, dirOf, normalizePath, noteTitle, resolveLink } from "../links";
+import { basename, contentHash, DAILY_RE, dirOf, fuzzyScore, normalizePath, noteTitle, resolveLink } from "../links";
 import { buildGraph, dailyPath, searchNotes, type GraphData } from "../graph-data";
 import * as backend from "./backend";
 import { BlockView } from "./blockview";
 import { GraphView } from "./graph";
+import { setupLinkComplete } from "./linkcomplete";
 import { setupWiki } from "./wiki";
 
 const $ = <T extends HTMLElement>(sel: string): T => document.querySelector(sel) as T;
@@ -20,6 +21,11 @@ const qoInput = $<HTMLInputElement>("#qo-input");
 const qoList = $<HTMLUListElement>("#qo-list");
 const setupEl = $<HTMLElement>("#setup");
 const setupPath = $<HTMLInputElement>("#setup-path");
+const libraryEl = $<HTMLElement>("#library");
+const qoBrowse = $<HTMLElement>("#qo-browse");
+
+/** Phone-shaped viewport: browse + search live in one full-screen surface. */
+const isPhone = (): boolean => matchMedia("(max-width: 700px)").matches;
 
 let paths: string[] = [];
 let note: backend.Note | null = null;
@@ -382,6 +388,7 @@ function renderDir(d: DirNode, prefix: string): DocumentFragment {
     if (p === note?.path) a.classList.add("current");
     a.addEventListener("click", () => {
       closeSidebar();
+      closeQuickOpen();
       openPath(p);
     });
     frag.appendChild(a);
@@ -390,6 +397,12 @@ function renderDir(d: DirNode, prefix: string): DocumentFragment {
 }
 
 function toggleSidebar(): void {
+  if (isPhone()) {
+    // the drawer is cramped on phones — browse in the full-screen files view
+    if (qoEl.hidden) openQuickOpen(false);
+    else closeQuickOpen();
+    return;
+  }
   const open = document.body.classList.toggle("sidebar-open");
   $("#backdrop").hidden = !open;
 }
@@ -414,27 +427,6 @@ function addRecent(path: string): void {
   localStorage.setItem("carnet.recent", JSON.stringify(r));
 }
 
-function fuzzyScore(query: string, path: string): number {
-  const q = query.toLowerCase();
-  const s = path.toLowerCase();
-  let qi = 0;
-  let streak = 0;
-  let score = 0;
-  for (let i = 0; i < s.length && qi < q.length; i++) {
-    if (s[i] === q[qi]) {
-      qi++;
-      streak++;
-      score += 1 + streak;
-      if (i === 0 || "/-_ .".includes(s[i - 1])) score += 6;
-    } else {
-      streak = 0;
-    }
-  }
-  if (qi < q.length) return -1;
-  if (basename(s).startsWith(q)) score += 20;
-  return score - s.length * 0.01;
-}
-
 interface QoItem {
   path?: string;
   create?: string;
@@ -445,19 +437,32 @@ let qoItems: QoItem[] = [];
 let qoSel = 0;
 let qoSearchTimer: ReturnType<typeof setTimeout> | undefined;
 
-function openQuickOpen(): void {
+/** On phones the quick-open overlay doubles as the file browser: the sidebar's
+ *  library (tree + new-note + change-folder) moves in under the search field
+ *  whenever the query is empty. `focus` pops the keyboard — wanted when the
+ *  intent is searching, not when it's browsing. */
+function openQuickOpen(focus = true): void {
   qoEl.hidden = false;
   qoInput.value = "";
+  if (isPhone()) qoBrowse.appendChild(libraryEl);
   updateQuickOpen("");
-  qoInput.focus();
+  if (focus) qoInput.focus();
 }
 
 function closeQuickOpen(): void {
   qoEl.hidden = true;
+  if (libraryEl.parentElement === qoBrowse) $("#sidebar").appendChild(libraryEl);
 }
 
 function updateQuickOpen(q: string): void {
   clearTimeout(qoSearchTimer);
+  const browsing = q === "" && libraryEl.parentElement === qoBrowse;
+  qoBrowse.hidden = !browsing;
+  if (browsing) {
+    qoItems = [];
+    renderQoItems();
+    return;
+  }
   if (!q) {
     qoItems = recents()
       .filter((p) => paths.includes(p))
@@ -558,6 +563,23 @@ qoInput.addEventListener("keydown", (e) => {
 qoEl.addEventListener("click", (e) => {
   if (e.target === qoEl) closeQuickOpen();
 });
+$("#qo-close").addEventListener("click", closeQuickOpen);
+
+/* ---------- safe area (Android draws edge-to-edge) ---------- */
+
+/** Android's webview reports env(safe-area-inset-*) as 0, so measure the
+ *  system bars natively and override the CSS variables. */
+async function applySafeArea(): Promise<void> {
+  if (!IS_ANDROID) return;
+  try {
+    const { top, bottom } = await backend.safeAreaInsets();
+    const st = document.documentElement.style;
+    if (top > 0) st.setProperty("--safe-top", `${Math.ceil(top)}px`);
+    if (bottom > 0) st.setProperty("--safe-bottom", `${Math.ceil(bottom)}px`);
+  } catch {
+    /* keep the env() fallback */
+  }
+}
 
 /* ---------- refresh on focus (Dropbox may have synced) ---------- */
 
@@ -665,6 +687,7 @@ async function changeVault(): Promise<void> {
   blockView.flush();
   await save();
   closeSidebar();
+  closeQuickOpen();
   graphView.hide();
   backend.clearVault();
   started = false;
@@ -680,7 +703,7 @@ async function changeVault(): Promise<void> {
 $("#btn-menu").addEventListener("click", toggleSidebar);
 $("#backdrop").addEventListener("click", closeSidebar);
 $("#btn-today").addEventListener("click", () => openDaily());
-$("#btn-search").addEventListener("click", openQuickOpen);
+$("#btn-search").addEventListener("click", () => openQuickOpen());
 $("#btn-graph").addEventListener("click", () => (location.hash = "#/graph"));
 $("#btn-edit").addEventListener("click", () => (editing ? showPreview() : showEditor()));
 $("#btn-new").addEventListener("click", () => {
@@ -777,6 +800,7 @@ document.addEventListener("visibilitychange", () => {
   } else {
     void refreshFromDisk();
     void refreshSetupChecks();
+    void applySafeArea(); // rotation may have changed the bars
   }
 });
 window.addEventListener("hashchange", () => {
@@ -808,6 +832,11 @@ async function startApp(): Promise<void> {
 
 async function boot(): Promise<void> {
   setupWiki();
+  void applySafeArea();
+  setupLinkComplete({
+    paths: () => paths,
+    currentPath: () => note?.path ?? null,
+  });
   const root = backend.vaultRoot();
   if (root && (await backend.vaultValid(root).catch(() => false))) {
     await startApp();
