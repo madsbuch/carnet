@@ -87,8 +87,15 @@ Two Android-specific notes:
 ## CI builds
 
 Every push to `main` runs [.github/workflows/build.yml](.github/workflows/build.yml): tests, a
-universal macOS `.dmg` (Apple Silicon + Intel), and an installable Android `.apk` — all three
-downloadable from the run's **Artifacts** on GitHub.
+universal macOS `.dmg` (Apple Silicon + Intel), and an installable Android `.apk`. Both are
+published to the rolling **[latest release](../../releases/latest)**, with stable public
+download links (no GitHub login, no artifact expiry):
+
+- **macOS:** <https://github.com/madsbuch/carnet/releases/latest/download/Carnet.dmg>
+- **Android:** <https://github.com/madsbuch/carnet/releases/latest/download/carnet.apk>
+  (open this URL straight from your phone to install)
+
+They're also on each run's **Artifacts** if you need a specific commit's build.
 
 - **macOS:** the `.dmg` is unsigned/un-notarized, so the first launch needs right-click → Open
   (or `xattr -dr com.apple.quarantine /Applications/Carnet.app`).
