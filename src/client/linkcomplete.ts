@@ -10,19 +10,35 @@ import { dirOf, fuzzyScore, noteTitle, resolveLink } from "../links";
 export interface LinkCompleteHost {
   paths(): string[];
   currentPath(): string | null;
+  /** Recently opened notes, best first — the suggestions before any typing. */
+  recents(): string[];
 }
 
 const MAX_ITEMS = 6;
 
-/** The unclosed "[query" immediately before the caret, if any. */
-function linkContext(t: HTMLTextAreaElement): { bracket: number; query: string } | null {
+/** The unclosed "[query" immediately before the caret, if any. A bare "["
+ *  is reported too; the caller decides whether it counts (typed brackets
+ *  stay quiet — plain markdown links exist — but the toolbar button opens
+ *  suggestions right away). */
+function linkContext(
+  t: HTMLTextAreaElement,
+): { bracket: number; query: string; image: boolean } | null {
   const caret = t.selectionStart;
   if (caret !== t.selectionEnd) return null;
   const before = t.value.slice(0, caret);
   const m = /\[([^\[\]\n]*)$/.exec(before);
-  if (!m || m[1] === "") return null; // bare "[" stays quiet — plain markdown links exist
-  if (before[m.index - 1] === "!") return null; // image syntax
-  return { bracket: m.index, query: m[1] };
+  if (!m) return null;
+  // "![" is image syntax — but only probably: a sentence ending in "!"
+  // followed by the link button forms the same text, so the caller decides
+  return { bracket: m.index, query: m[1], image: before[m.index - 1] === "!" };
+}
+
+let insertTrigger: ((t: HTMLTextAreaElement) => void) | null = null;
+
+/** Toolbar entry point: insert "[" at the caret (or wrap the selection in
+ *  brackets) and open the suggestions immediately. No-op before setup. */
+export function insertWikiLink(t: HTMLTextAreaElement): void {
+  insertTrigger?.(t);
 }
 
 /** Viewport position of the caret, via an offscreen mirror of the textarea. */
@@ -68,11 +84,25 @@ export function setupLinkComplete(host: LinkCompleteHost): void {
   let bracket = 0;
   let matches: string[] = [];
   let sel = 0;
+  /** Bracket index where an empty query still shows suggestions (button flow). */
+  let emptyOk: number | null = null;
 
   function hide(): void {
     panel.hidden = true;
     target = null;
     matches = [];
+    emptyOk = null;
+  }
+
+  /** Suggestions before any typing: recent notes first, shortest paths after. */
+  function emptyQueryMatches(): string[] {
+    const all = host.paths();
+    const out = host.recents().filter((p) => all.includes(p));
+    for (const p of [...all].sort((a, b) => a.length - b.length || a.localeCompare(b))) {
+      if (out.length >= MAX_ITEMS) break;
+      if (!out.includes(p)) out.push(p);
+    }
+    return out.slice(0, MAX_ITEMS);
   }
 
   /** The link name to insert: the plain title when it resolves to this note,
@@ -133,17 +163,22 @@ export function setupLinkComplete(host: LinkCompleteHost): void {
 
   function update(t: HTMLTextAreaElement): void {
     const ctx = linkContext(t);
-    if (!ctx) {
+    // typed brackets stay quiet when bare (plain markdown links) or after "!"
+    // (images); a bracket placed by the link button suppresses both guards
+    if (!ctx || (ctx.bracket !== emptyOk && (ctx.query === "" || ctx.image))) {
       hide();
       return;
     }
-    matches = host
-      .paths()
-      .map((p) => [fuzzyScore(ctx.query, p), p] as const)
-      .filter(([s]) => s >= 0)
-      .sort((a, b) => b[0] - a[0])
-      .slice(0, MAX_ITEMS)
-      .map(([, p]) => p);
+    matches =
+      ctx.query === ""
+        ? emptyQueryMatches()
+        : host
+            .paths()
+            .map((p) => [fuzzyScore(ctx.query, p), p] as const)
+            .filter(([s]) => s >= 0)
+            .sort((a, b) => b[0] - a[0])
+            .slice(0, MAX_ITEMS)
+            .map(([, p]) => p);
     if (matches.length === 0) {
       hide();
       return;
@@ -160,6 +195,21 @@ export function setupLinkComplete(host: LinkCompleteHost): void {
     if (el.id === "editor" || el.closest(".block-edit")) return el;
     return null;
   }
+
+  insertTrigger = (t) => {
+    const s = t.selectionStart;
+    const e = t.selectionEnd;
+    if (s !== e) {
+      // wrap the selection into a link outright
+      t.setRangeText("[" + t.value.slice(s, e) + "]", s, e, "end");
+    } else {
+      t.setRangeText("[", s, s, "end");
+      emptyOk = s; // bare bracket, but suggestions were asked for explicitly
+    }
+    // the input event resizes the textarea, schedules the save, and lands in
+    // the listener below, which opens the panel
+    t.dispatchEvent(new Event("input", { bubbles: true }));
+  };
 
   document.addEventListener("input", (e) => {
     const t = eligible(e.target);

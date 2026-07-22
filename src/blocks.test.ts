@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   convertBlock,
+  insertSeparator,
   itemContentStart,
   nextItemPrefix,
   segmentBlocks,
@@ -142,5 +143,34 @@ describe("nextItemPrefix", () => {
     expect(nextItemPrefix(item({ marker: "-", indent: 0, task: true }))).toBe("- [ ] ");
     expect(nextItemPrefix(item({ marker: "3.", indent: 0, ordered: true }))).toBe("4. ");
     expect(nextItemPrefix(item({ marker: "1)", indent: 2, ordered: true }))).toBe("  2) ");
+  });
+});
+
+describe("insertSeparator", () => {
+  test("empty block becomes a separator with a fresh line below", () => {
+    const { lines, caret } = insertSeparator("", 0);
+    expect(lines).toEqual(["---", "", ""]);
+    expect(lines[caret]).toBe("");
+    expect(caret).toBe(2);
+  });
+
+  test("caret at end of text puts the break after it", () => {
+    const text = "some thought";
+    const { lines, caret } = insertSeparator(text, text.length);
+    expect(lines).toEqual(["some thought", "", "---", "", ""]);
+    expect(caret).toBe(4);
+  });
+
+  test("caret mid-text splits into two blocks around the break", () => {
+    const text = "before after";
+    const { lines, caret } = insertSeparator(text, "before ".length);
+    expect(lines).toEqual(["before ", "", "---", "", "after"]);
+    expect(lines[caret]).toBe("after");
+  });
+
+  test("the produced lines segment as p / hr / p", () => {
+    const { lines } = insertSeparator("before after", "before ".length);
+    const types = segmentBlocks(lines.join("\n")).map((b) => b.type);
+    expect(types).toEqual(["p", "blank", "hr", "blank", "p"]);
   });
 });

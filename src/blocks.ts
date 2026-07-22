@@ -203,6 +203,21 @@ export function convertBlock(text: string, target: TargetType): string {
   }
 }
 
+/**
+ * Split a block's text at pos and put a thematic break between the halves.
+ * Returns the replacement lines and the index (into those lines) of the line
+ * that should receive the caret — always the first line after the break, so
+ * the flow is "tap separator, keep writing below it".
+ */
+export function insertSeparator(text: string, pos: number): { lines: string[]; caret: number } {
+  const before = text.slice(0, pos);
+  const after = text.slice(pos);
+  const beforeLines = before.trim() === "" ? [] : before.split("\n");
+  const afterLines = after.trim() === "" ? [""] : after.split("\n");
+  const lines = [...beforeLines, ...(beforeLines.length > 0 ? [""] : []), "---", "", ...afterLines];
+  return { lines, caret: lines.length - afterLines.length };
+}
+
 /** Column where an item line's text content starts (after marker and task box). */
 export function itemContentStart(text: string): number {
   const firstLine = text.includes("\n") ? text.slice(0, text.indexOf("\n")) : text;
