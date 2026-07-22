@@ -31,9 +31,13 @@
 </header>
 
 <nav id="sidebar">
-  <div id="tree"></div>
-  <button id="btn-new">+ New note</button>
-  <button id="btn-vault">Change notes folder&hellip;</button>
+  <!-- On phones #library moves into the quick-open overlay (one full-screen
+       surface for browse + search); on desktop it stays in this drawer. -->
+  <div id="library">
+    <div id="tree"></div>
+    <button id="btn-new">+ New note</button>
+    <button id="btn-vault">Change notes folder&hellip;</button>
+  </div>
 </nav>
 <div id="backdrop" hidden></div>
 
@@ -48,8 +52,14 @@
 
 <div id="quickopen" hidden>
   <div id="qo-panel">
-    <input id="qo-input" type="text" placeholder="Open or create a note&hellip;" autocomplete="off" />
+    <div id="qo-top">
+      <input id="qo-input" type="text" placeholder="Open or create a note&hellip;" autocomplete="off" />
+      <button id="qo-close" class="icon" title="Close (esc)" aria-label="Close">
+        <svg viewBox="0 0 20 20"><path d="M5 5l10 10M15 5L5 15"/></svg>
+      </button>
+    </div>
     <ul id="qo-list"></ul>
+    <div id="qo-browse" hidden></div>
     <div id="qo-hint"><kbd>&#8593;&#8595;</kbd> navigate &nbsp; <kbd>&#9166;</kbd> open &nbsp; <kbd>esc</kbd> close</div>
   </div>
 </div>
@@ -75,8 +85,8 @@
       </li>
       <li id="setup-step-sync">
         <div class="step-title"><span class="step-mark"></span>Sync Dropbox to this phone</div>
-        <p>The Dropbox app keeps files in the cloud only. Use FolderSync (or Dropsync) to two-way sync your Dropbox to local storage, e.g. /storage/emulated/0/Dropbox.</p>
-        <button id="setup-sync-btn" class="step-btn">Get FolderSync&hellip;</button>
+        <p>The Dropbox app keeps files in the cloud only. Use a sync app &mdash; Dropsync, FolderSync, or similar &mdash; to two-way sync your Dropbox to local storage, e.g. /storage/emulated/0/Dropbox. Carnet finds the folder once it holds your notes, whichever app put it there.</p>
+        <button id="setup-sync-btn" class="step-btn">Find a sync app&hellip;</button>
       </li>
       <li id="setup-step-folder">
         <div class="step-title"><span class="step-mark"></span>Open the folder</div>

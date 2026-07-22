@@ -221,6 +221,55 @@ mod android {
         .unwrap_or_else(|_| std::fs::read_dir("/storage/emulated/0").is_ok())
     }
 
+    /// Status/navigation bar heights in CSS pixels. The webview draws
+    /// edge-to-edge on Android and env(safe-area-inset-*) stays 0 there, so
+    /// the UI asks the window directly.
+    pub fn safe_area_insets() -> Result<(f64, f64), String> {
+        on_android_context(|env, activity| {
+            let window = env
+                .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?
+                .l()?;
+            let decor = env
+                .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
+                .l()?;
+            let insets = env
+                .call_method(
+                    &decor,
+                    "getRootWindowInsets",
+                    "()Landroid/view/WindowInsets;",
+                    &[],
+                )?
+                .l()?;
+            if insets.is_null() {
+                return Ok((0.0, 0.0));
+            }
+            let top = env
+                .call_method(&insets, "getSystemWindowInsetTop", "()I", &[])?
+                .i()? as f64;
+            let bottom = env
+                .call_method(&insets, "getSystemWindowInsetBottom", "()I", &[])?
+                .i()? as f64;
+            let res = env
+                .call_method(
+                    activity,
+                    "getResources",
+                    "()Landroid/content/res/Resources;",
+                    &[],
+                )?
+                .l()?;
+            let dm = env
+                .call_method(
+                    &res,
+                    "getDisplayMetrics",
+                    "()Landroid/util/DisplayMetrics;",
+                    &[],
+                )?
+                .l()?;
+            let density = env.get_field(&dm, "density", "F")?.f()? as f64;
+            Ok((top / density, bottom / density))
+        })
+    }
+
     /// Open the system screen where the user flips "All files access" on —
     /// Carnet's own screen when the device resolves it, the global list
     /// otherwise (some OEMs don't handle the per-app intent).
@@ -277,6 +326,24 @@ mod android {
     }
 }
 
+#[derive(Serialize)]
+pub struct SafeArea {
+    top: f64,
+    bottom: f64,
+}
+
+/// System bar insets in CSS pixels; zero anywhere but Android.
+#[tauri::command]
+async fn safe_area_insets() -> SafeArea {
+    #[cfg(target_os = "android")]
+    {
+        let (top, bottom) = android::safe_area_insets().unwrap_or((0.0, 0.0));
+        return SafeArea { top, bottom };
+    }
+    #[cfg(not(target_os = "android"))]
+    SafeArea { top: 0.0, bottom: 0.0 }
+}
+
 /// Whether the app is allowed to read the phone's shared storage.
 /// Trivially true anywhere but Android.
 #[tauri::command]
@@ -296,30 +363,58 @@ async fn request_storage_access() -> Result<(), String> {
     Err("only needed on Android".into())
 }
 
-/// Folders where a Dropbox sync app plausibly put the notes, for the setup
-/// screen to offer as one-tap choices. Empty off Android (the paths can't
-/// exist elsewhere).
+/// Depth-limited, budgeted probe for a markdown file. The budget caps
+/// directory entries visited so a huge folder can't stall the setup screen.
+fn contains_markdown(dir: &Path, depth: u32, budget: &mut u32) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(dir) else { return false };
+    for e in entries.flatten() {
+        *budget += 1;
+        if *budget > 2000 {
+            return false;
+        }
+        let name = e.file_name().to_string_lossy().to_lowercase();
+        if name.starts_with('.') || IGNORED.contains(&name.as_str()) {
+            continue;
+        }
+        let Ok(ft) = e.file_type() else { continue };
+        if ft.is_file() && name.ends_with(".md") {
+            return true;
+        }
+        if ft.is_dir() && contains_markdown(&e.path(), depth - 1, budget) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Folders that plausibly hold the user's synced notes, for the setup screen
+/// to offer as one-tap choices. Agnostic to the sync app: any top-level
+/// folder on shared storage with markdown inside counts, Dropbox-ish names
+/// first. Empty off Android (the base path can't exist elsewhere).
 #[tauri::command]
 async fn find_vault_candidates() -> Vec<String> {
+    // media/system folders that can be huge and never hold notes
+    const SKIP: &[&str] = &[
+        "Android", "DCIM", "Pictures", "Movies", "Music", "Ringtones", "Alarms",
+        "Notifications", "Podcasts", "Audiobooks", "Recordings",
+    ];
     let base = Path::new("/storage/emulated/0");
+    let Ok(entries) = fs::read_dir(base) else { return Vec::new() };
     let mut out: Vec<String> = Vec::new();
-    for guess in ["Dropbox", "FolderSync/Dropbox", "Documents/Dropbox", "Download/Dropbox"] {
-        let p = base.join(guess);
-        if p.is_dir() {
-            out.push(p.to_string_lossy().into_owned());
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || SKIP.contains(&name.as_str()) || !e.path().is_dir() {
+            continue;
+        }
+        if contains_markdown(&e.path(), 3, &mut 0) {
+            out.push(e.path().to_string_lossy().into_owned());
         }
     }
-    if let Ok(entries) = fs::read_dir(base) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_lowercase();
-            if name.contains("dropbox") && e.path().is_dir() {
-                let p = e.path().to_string_lossy().into_owned();
-                if !out.contains(&p) {
-                    out.push(p);
-                }
-            }
-        }
-    }
+    // "Dropbox"/"Dropsync" and friends before e.g. "Documents"
+    out.sort_by_key(|p| (!p.to_lowercase().contains("drop"), p.clone()));
     out
 }
 
@@ -334,6 +429,7 @@ pub fn run() {
             read_note,
             read_all_notes,
             write_note,
+            safe_area_insets,
             storage_ready,
             request_storage_access,
             find_vault_candidates
