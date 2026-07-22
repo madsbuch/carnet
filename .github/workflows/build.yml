@@ -114,3 +114,44 @@ jobs:
           name: carnet-android
           path: carnet.apk
           if-no-files-found: error
+
+  release:
+    # Publish the freshest macOS .dmg and Android .apk to a rolling "latest"
+    # release, so they have stable public download URLs (no GitHub login, no
+    # artifact expiry):
+    #   https://github.com/madsbuch/carnet/releases/latest/download/Carnet.dmg
+    #   https://github.com/madsbuch/carnet/releases/latest/download/carnet.apk
+    needs: [test, macos, android]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect release assets under stable names
+        run: |
+          mkdir -p release
+          # The .dmg name carries the version; copy it to a stable filename so
+          # the /releases/latest/download/ URL never changes between builds.
+          dmg=$(ls artifacts/carnet-macos/*.dmg | head -1)
+          cp "$dmg" release/Carnet.dmg
+          cp artifacts/carnet-android/carnet.apk release/carnet.apk
+          ls -la release
+      - name: Publish to the "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build
+          body: |
+            Rolling build from the latest commit on `main` (${{ github.sha }}).
+
+            - **Carnet.dmg** — universal macOS app (Apple Silicon + Intel). Unsigned:
+              first launch needs right-click → Open.
+            - **carnet.apk** — Android app. Grant "All files access" after installing.
+          files: |
+            release/Carnet.dmg
+            release/carnet.apk
+          make_latest: true
+          prerelease: false
