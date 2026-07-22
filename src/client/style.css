@@ -399,7 +399,70 @@ body.sidebar-open #sidebar { transform: none; }
 }
 #setup-browse { background: var(--code-bg); color: var(--fg); }
 #setup-go { background: var(--accent); color: #fff; width: 100%; }
-#setup .hint { font-size: 12px; color: var(--faint); }
+
+/* Android onboarding checklist: numbered circles that turn into accent
+   checkmarks; a finished step collapses to just its title. */
+#setup-steps {
+  list-style: none;
+  counter-reset: step;
+  margin: 20px 0 4px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+#setup-steps li { counter-increment: step; }
+.step-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  font-size: 14px;
+}
+.step-mark {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  background: var(--code-bg);
+  color: var(--muted);
+}
+.step-mark::before { content: counter(step); }
+#setup-steps li.done .step-mark { background: var(--accent); color: #fff; }
+#setup-steps li.done .step-mark::before { content: "\2713"; }
+#setup-steps li p { margin: 6px 0 8px 30px; font-size: 13px; }
+.step-btn {
+  margin-left: 30px;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13px;
+  background: var(--code-bg);
+  color: var(--fg);
+  cursor: pointer;
+}
+#setup-steps li.done p,
+#setup-steps li.done .step-btn { display: none; }
+#setup-candidates {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 0 30px;
+}
+#setup-candidates button {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--fg);
+  font: 12px ui-monospace, "SF Mono", Menlo, monospace;
+  cursor: pointer;
+}
 
 /* ---------- toast ---------- */
 #toast {

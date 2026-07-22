@@ -81,6 +81,10 @@ jobs:
           p.write_text(xml)
           print(xml)
           EOF
+      - name: Apply the app icon to the generated Android project
+        # `tauri icon` writes the launcher mipmaps straight into gen/android,
+        # which only exists after android init.
+        run: bun tauri icon icon/app-icon.json
       - name: Build APK
         run: bun tauri android build --apk
       - name: Sign APK
@@ -149,7 +153,7 @@ jobs:
 
             - **Carnet.dmg** — universal macOS app (Apple Silicon + Intel). Unsigned:
               first launch needs right-click → Open.
-            - **carnet.apk** — Android app. Grant "All files access" after installing.
+            - **carnet.apk** — Android app. First launch walks you through setup.
           files: |
             release/Carnet.dmg
             release/carnet.apk

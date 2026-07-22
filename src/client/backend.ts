@@ -39,6 +39,15 @@ export async function browseForVault(): Promise<string | null> {
   return typeof picked === "string" ? picked : null;
 }
 
+/** Android: is "All files access" granted? Always true on desktop. */
+export const storageReady = () => invoke<boolean>("storage_ready");
+
+/** Android: open the system settings screen for "All files access". */
+export const requestStorageAccess = () => invoke<void>("request_storage_access");
+
+/** Android: existing folders that look like a synced Dropbox. */
+export const findVaultCandidates = () => invoke<string[]>("find_vault_candidates");
+
 function must(): string {
   if (!root) throw new Error("no vault selected");
   return root;

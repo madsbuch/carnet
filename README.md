@@ -69,7 +69,9 @@ bun tauri android dev      # run on a connected device
 bun tauri android build    # release apk/aab
 ```
 
-Two Android-specific notes:
+On first launch the app walks through the Android setup itself: a checklist that opens the
+"All files access" settings screen, points at FolderSync, detects the synced folder, and
+ticks each step off as it's done. Two notes on what's behind that:
 
 1. **Storage permission.** Carnet reads a folder of your choosing, so after
    `android init`, add to `src-tauri/gen/android/app/src/main/AndroidManifest.xml`:
@@ -78,11 +80,13 @@ Two Android-specific notes:
    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
    ```
 
-   and grant "All files access" to Carnet in Android settings after installing.
+   The setup screen sends the user to the right settings page (and won't proceed until
+   the switch is flipped).
 
 2. **Getting Dropbox files onto the phone.** The Dropbox app doesn't mirror files to local
    storage. Use [FolderSync](https://foldersync.io/) (or Dropsync) to two-way sync your
-   Dropbox to e.g. `/storage/emulated/0/Dropbox`, then point Carnet at that folder.
+   Dropbox to e.g. `/storage/emulated/0/Dropbox` — the setup screen offers any folder it
+   finds that looks like a synced Dropbox.
 
 ## CI builds
 
@@ -100,7 +104,7 @@ They're also on each run's **Artifacts** if you need a specific commit's build.
 - **macOS:** the `.dmg` is unsigned/un-notarized, so the first launch needs right-click → Open
   (or `xattr -dr com.apple.quarantine /Applications/Carnet.app`).
 - **Android:** the APK already carries the storage permission (CI patches the generated manifest);
-  after installing, grant Carnet "All files access" in Android settings. Without signing secrets
+  the first-run setup walks through granting "All files access". Without signing secrets
   the APK is signed with a throwaway key, so each new build needs uninstall-then-install. For
   in-place updates, create a keystore once and add it as repository secrets:
 
@@ -121,6 +125,8 @@ src/graph-data.ts   link graph, search, daily-note logic (shared, pure)
 src/client/         the UI: app.ts, graph.ts (canvas), wiki.ts (marked extension)
 src/dev.ts          dev-only hot-reload server for `tauri dev`
 src-tauri/          Rust: filesystem commands (list/read/write, conflict detection)
+icon/               app icon sources; regenerate with `python3 icon/generate.py`
+                    then `bun tauri icon icon/app-icon.json`
 ```
 
 All note intelligence lives in the shared TypeScript modules; Rust only does file IO. The

@@ -64,13 +64,30 @@
 <div id="setup" hidden>
   <div id="setup-panel">
     <h2>Carnet</h2>
-    <p>Point Carnet at the folder that holds your markdown notes &mdash; typically your Dropbox folder. Files stay where they are; Dropbox keeps doing the syncing.</p>
+    <p id="setup-intro">Point Carnet at the folder that holds your markdown notes &mdash; typically your Dropbox folder. Files stay where they are; Dropbox keeps doing the syncing.</p>
+    <!-- Android: the folder picker doesn't exist there, so the setup becomes a
+         guided checklist — steps tick themselves off as the app detects each one. -->
+    <ol id="setup-steps" hidden>
+      <li id="setup-step-access">
+        <div class="step-title"><span class="step-mark"></span>Allow file access</div>
+        <p>Your notes live in a folder on this phone, so Android has to grant Carnet &ldquo;All files access&rdquo;. Flip the switch in settings, then come back here.</p>
+        <button id="setup-access-btn" class="step-btn">Open Android settings&hellip;</button>
+      </li>
+      <li id="setup-step-sync">
+        <div class="step-title"><span class="step-mark"></span>Sync Dropbox to this phone</div>
+        <p>The Dropbox app keeps files in the cloud only. Use FolderSync (or Dropsync) to two-way sync your Dropbox to local storage, e.g. /storage/emulated/0/Dropbox.</p>
+        <button id="setup-sync-btn" class="step-btn">Get FolderSync&hellip;</button>
+      </li>
+      <li id="setup-step-folder">
+        <div class="step-title"><span class="step-mark"></span>Open the folder</div>
+        <div id="setup-candidates" hidden></div>
+      </li>
+    </ol>
     <div id="setup-row">
       <input id="setup-path" type="text" placeholder="/Users/you/Dropbox" autocomplete="off" spellcheck="false" />
       <button id="setup-browse">Browse&hellip;</button>
     </div>
     <button id="setup-go">Open notes</button>
-    <p class="hint">On Android: sync your Dropbox to local storage with an app like FolderSync, then enter that folder here (e.g. /storage/emulated/0/Dropbox).</p>
   </div>
 </div>
 
