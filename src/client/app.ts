@@ -708,7 +708,7 @@ $("#setup-access-btn").addEventListener("click", () => {
 });
 $("#setup-sync-btn").addEventListener("click", () => {
   void backend
-    .openUrl("https://play.google.com/store/apps/details?id=dk.tacit.android.foldersync.lite")
+    .openUrl("https://play.google.com/store/search?q=dropbox%20sync&c=apps")
     .catch((err) => toast(String(err)));
 });
 

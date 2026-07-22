@@ -84,9 +84,10 @@ ticks each step off as it's done. Two notes on what's behind that:
    the switch is flipped).
 
 2. **Getting Dropbox files onto the phone.** The Dropbox app doesn't mirror files to local
-   storage. Use [FolderSync](https://foldersync.io/) (or Dropsync) to two-way sync your
-   Dropbox to e.g. `/storage/emulated/0/Dropbox` — the setup screen offers any folder it
-   finds that looks like a synced Dropbox.
+   storage. Use a sync app — Dropsync, [FolderSync](https://foldersync.io/), or similar —
+   to two-way sync your Dropbox to e.g. `/storage/emulated/0/Dropbox`. The setup screen is
+   agnostic to which app you pick: it offers any top-level storage folder that holds
+   markdown files.
 
 ## CI builds
 
