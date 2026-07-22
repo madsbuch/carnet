@@ -836,6 +836,7 @@ async function boot(): Promise<void> {
   setupLinkComplete({
     paths: () => paths,
     currentPath: () => note?.path ?? null,
+    recents,
   });
   const root = backend.vaultRoot();
   if (root && (await backend.vaultValid(root).catch(() => false))) {

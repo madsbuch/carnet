@@ -5,7 +5,8 @@
 // (data-start/data-end). Tapping a block swaps it for a small textarea holding
 // those raw markdown lines; committing splices them back. Enter in a list item
 // creates the next item; Enter in a paragraph starts a new block; a toolbar on
-// the active block retypes it (¶/H1-H3/•/☑/❝). The file is never rewritten
+// the active block retypes it (¶/H1-H3/•/☑/❝), inserts a wiki link or a
+// separator, or deletes it. The file is never rewritten
 // wholesale — every edit is a line splice on what was typed.
 //
 // State invariants:
@@ -19,6 +20,7 @@
 import { marked } from "marked";
 import {
   convertBlock,
+  insertSeparator,
   itemContentStart,
   nextItemPrefix,
   segmentBlocks,
@@ -27,6 +29,7 @@ import {
   type TargetType,
 } from "../blocks";
 import { normalizeTasks, taskLinesIn, taskState, toggleTaskAtLine } from "../links";
+import { insertWikiLink } from "./linkcomplete";
 
 export interface BlockHost {
   content(): string;
@@ -58,7 +61,7 @@ interface RenderGroup {
   items?: Block[];
 }
 
-const TOOLS: { t: TargetType | "delete"; label: string; title: string }[] = [
+const TOOLS: { t: TargetType | "delete" | "link" | "hrule"; label: string; title: string }[] = [
   { t: "p", label: "¶", title: "Paragraph" },
   { t: "h1", label: "H1", title: "Heading 1" },
   { t: "h2", label: "H2", title: "Heading 2" },
@@ -66,6 +69,8 @@ const TOOLS: { t: TargetType | "delete"; label: string; title: string }[] = [
   { t: "bullet", label: "•", title: "Bullet list" },
   { t: "task", label: "☑", title: "To-do" },
   { t: "quote", label: "❝", title: "Quote" },
+  { t: "link", label: "[…]", title: "Link to a note" },
+  { t: "hrule", label: "―", title: "Separator" },
   { t: "delete", label: "✕", title: "Delete block" },
 ];
 
@@ -365,6 +370,17 @@ export class BlockView {
       btn.addEventListener("click", () => {
         if (tool.t === "delete") {
           this.deleteActive();
+          return;
+        }
+        if (tool.t === "link") {
+          insertWikiLink(textarea);
+          return;
+        }
+        if (tool.t === "hrule") {
+          // split at the caret, lay a separator between the halves, and
+          // continue writing in the block below it
+          const { lines, caret } = insertSeparator(textarea.value, textarea.selectionStart);
+          this.replaceActive(lines, caret, 0);
           return;
         }
         textarea.value = convertBlock(textarea.value, tool.t);
