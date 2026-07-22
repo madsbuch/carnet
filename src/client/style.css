@@ -49,7 +49,9 @@ body {
   display: flex;
   align-items: center;
   gap: 4px;
-  height: 48px;
+  /* border-box is global, so the bar must grow by the inset — a fixed 48px
+     would swallow the padding and leave the bar under the status bar */
+  height: calc(48px + var(--safe-top));
   padding: 0 8px;
   padding-top: var(--safe-top);
   background: var(--bg);
