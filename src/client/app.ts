@@ -586,8 +586,52 @@ async function refreshFromDisk(): Promise<void> {
 
 /* ---------- setup screen ---------- */
 
+const IS_ANDROID = /android/i.test(navigator.userAgent);
+const setupStepsEl = $<HTMLElement>("#setup-steps");
+const stepAccessEl = $<HTMLElement>("#setup-step-access");
+const stepSyncEl = $<HTMLElement>("#setup-step-sync");
+const candidatesEl = $<HTMLElement>("#setup-candidates");
+
+/** Re-probe permission + synced folder and tick the checklist. Runs again
+ *  every time the app regains focus, so returning from Android settings or
+ *  FolderSync advances the steps by itself. */
+let setupCheckSeq = 0;
+async function refreshSetupChecks(): Promise<void> {
+  if (!IS_ANDROID || setupEl.hidden) return;
+  const seq = ++setupCheckSeq;
+  const ready = await backend.storageReady().catch(() => false);
+  if (seq !== setupCheckSeq || setupEl.hidden) return;
+  stepAccessEl.classList.toggle("done", ready);
+  const candidates = ready ? await backend.findVaultCandidates().catch(() => [] as string[]) : [];
+  if (seq !== setupCheckSeq || setupEl.hidden) return;
+  stepSyncEl.classList.toggle("done", candidates.length > 0);
+  candidatesEl.hidden = candidates.length === 0;
+  candidatesEl.replaceChildren(
+    ...candidates.map((path) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = path;
+      b.addEventListener("click", () => {
+        setupPath.value = path;
+      });
+      return b;
+    }),
+  );
+  const first = candidates[0];
+  if (first !== undefined && setupPath.value.trim() === "") setupPath.value = first;
+}
+
 async function showSetup(): Promise<void> {
   setupEl.hidden = false;
+  if (IS_ANDROID) {
+    $<HTMLElement>("#setup-intro").textContent =
+      "Notes are markdown files in a folder on this phone — typically a synced copy of your Dropbox. Two things to set up first:";
+    setupStepsEl.hidden = false;
+    $<HTMLElement>("#setup-browse").hidden = true; // no folder picker on Android
+    setupPath.placeholder = "/storage/emulated/0/Dropbox";
+    void refreshSetupChecks();
+    return;
+  }
   try {
     const home = (await homeDir()).replace(/\/$/, "");
     for (const guess of [home + "/Dropbox", home + "/Library/CloudStorage/Dropbox"]) {
@@ -597,7 +641,7 @@ async function showSetup(): Promise<void> {
       }
     }
   } catch {
-    /* mobile: user types the path */
+    /* no home dir — user types the path */
   }
 }
 
@@ -605,7 +649,11 @@ async function finishSetup(): Promise<void> {
   const p = setupPath.value.trim().replace(/\/$/, "");
   if (!p) return;
   if (!(await backend.vaultValid(p).catch(() => false))) {
-    toast("Not a folder: " + p);
+    if (IS_ANDROID && !(await backend.storageReady().catch(() => false))) {
+      toast("Allow file access first (step 1)");
+    } else {
+      toast("Not a folder: " + p);
+    }
     return;
   }
   backend.setVault(p);
@@ -652,6 +700,16 @@ $("#setup-browse").addEventListener("click", async () => {
 $("#setup-go").addEventListener("click", () => void finishSetup());
 setupPath.addEventListener("keydown", (e) => {
   if (e.key === "Enter") void finishSetup();
+});
+$("#setup-access-btn").addEventListener("click", () => {
+  void backend
+    .requestStorageAccess()
+    .catch(() => toast("Open Android Settings → Apps → Carnet → All files access"));
+});
+$("#setup-sync-btn").addEventListener("click", () => {
+  void backend
+    .openUrl("https://play.google.com/store/apps/details?id=dk.tacit.android.foldersync.lite")
+    .catch((err) => toast(String(err)));
 });
 
 editorEl.addEventListener("input", () => {
@@ -708,13 +766,17 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-window.addEventListener("focus", () => void refreshFromDisk());
+window.addEventListener("focus", () => {
+  void refreshFromDisk();
+  void refreshSetupChecks();
+});
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     blockView.commit(false);
     void save();
   } else {
     void refreshFromDisk();
+    void refreshSetupChecks();
   }
 });
 window.addEventListener("hashchange", () => {

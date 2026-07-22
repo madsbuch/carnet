@@ -178,6 +178,151 @@ async fn write_note(
     Ok(SaveResult::Ok { mtime: mtime_ms(&abs)? })
 }
 
+/// Android glue for the "All files access" permission the vault needs.
+/// Everything JNI runs on the Android main thread via wry's dispatch; a
+/// channel hands the result back to the (async) command thread.
+#[cfg(target_os = "android")]
+mod android {
+    use jni::objects::{JObject, JString, JValue};
+    use jni::JNIEnv;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use tauri_runtime_wry::wry::prelude::dispatch;
+
+    fn on_android_context<T: Send + 'static>(
+        f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<T> + Send + 'static,
+    ) -> Result<T, String> {
+        let (tx, rx) = mpsc::channel();
+        dispatch(move |env, activity, _webview| {
+            let out = f(env, activity);
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+            let _ = tx.send(out);
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())
+    }
+
+    /// True when Carnet can read shared storage: "All files access" on
+    /// API 30+, plain filesystem probe on older versions (where the
+    /// manifest permissions alone are enough).
+    pub fn storage_ready() -> bool {
+        on_android_context(|env, _| {
+            env.call_static_method(
+                "android/os/Environment",
+                "isExternalStorageManager",
+                "()Z",
+                &[],
+            )?
+            .z()
+        })
+        .unwrap_or_else(|_| std::fs::read_dir("/storage/emulated/0").is_ok())
+    }
+
+    /// Open the system screen where the user flips "All files access" on —
+    /// Carnet's own screen when the device resolves it, the global list
+    /// otherwise (some OEMs don't handle the per-app intent).
+    pub fn open_all_files_settings() -> Result<(), String> {
+        on_android_context(|env, activity| {
+            let pkg = env
+                .call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])?
+                .l()?;
+            let pkg: String = env.get_string(&JString::from(pkg))?.into();
+            let uri_str: JObject = env.new_string(format!("package:{pkg}"))?.into();
+            let uri = env
+                .call_static_method(
+                    "android/net/Uri",
+                    "parse",
+                    "(Ljava/lang/String;)Landroid/net/Uri;",
+                    &[JValue::Object(&uri_str)],
+                )?
+                .l()?;
+            let action: JObject = env
+                .new_string("android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION")?
+                .into();
+            let intent = env.new_object(
+                "android/content/Intent",
+                "(Ljava/lang/String;Landroid/net/Uri;)V",
+                &[JValue::Object(&action), JValue::Object(&uri)],
+            )?;
+            let per_app = env.call_method(
+                activity,
+                "startActivity",
+                "(Landroid/content/Intent;)V",
+                &[JValue::Object(&intent)],
+            );
+            if per_app.is_err() {
+                if env.exception_check()? {
+                    env.exception_clear()?;
+                }
+                let action: JObject = env
+                    .new_string("android.settings.MANAGE_ALL_FILES_ACCESS_PERMISSION")?
+                    .into();
+                let intent = env.new_object(
+                    "android/content/Intent",
+                    "(Ljava/lang/String;)V",
+                    &[JValue::Object(&action)],
+                )?;
+                env.call_method(
+                    activity,
+                    "startActivity",
+                    "(Landroid/content/Intent;)V",
+                    &[JValue::Object(&intent)],
+                )?;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Whether the app is allowed to read the phone's shared storage.
+/// Trivially true anywhere but Android.
+#[tauri::command]
+async fn storage_ready() -> bool {
+    #[cfg(target_os = "android")]
+    return android::storage_ready();
+    #[cfg(not(target_os = "android"))]
+    true
+}
+
+/// Send the user to the Android settings screen for "All files access".
+#[tauri::command]
+async fn request_storage_access() -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    return android::open_all_files_settings();
+    #[cfg(not(target_os = "android"))]
+    Err("only needed on Android".into())
+}
+
+/// Folders where a Dropbox sync app plausibly put the notes, for the setup
+/// screen to offer as one-tap choices. Empty off Android (the paths can't
+/// exist elsewhere).
+#[tauri::command]
+async fn find_vault_candidates() -> Vec<String> {
+    let base = Path::new("/storage/emulated/0");
+    let mut out: Vec<String> = Vec::new();
+    for guess in ["Dropbox", "FolderSync/Dropbox", "Documents/Dropbox", "Download/Dropbox"] {
+        let p = base.join(guess);
+        if p.is_dir() {
+            out.push(p.to_string_lossy().into_owned());
+        }
+    }
+    if let Ok(entries) = fs::read_dir(base) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            if name.contains("dropbox") && e.path().is_dir() {
+                let p = e.path().to_string_lossy().into_owned();
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -188,7 +333,10 @@ pub fn run() {
             list_notes,
             read_note,
             read_all_notes,
-            write_note
+            write_note,
+            storage_ready,
+            request_storage_access,
+            find_vault_candidates
         ])
         .run(tauri::generate_context!())
         .expect("error while running carnet");
