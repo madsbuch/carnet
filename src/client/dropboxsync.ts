@@ -36,8 +36,70 @@ export interface SyncHooks {
 const CURSOR_KEY = "carnet.dropbox.cursor";
 const REV_PREFIX = "carnet.dropbox.rev.";
 
-/** revs are persisted one localStorage key per path so a huge vault doesn't
- *  serialize a giant JSON blob on every save. */
+/**
+ * A {@link Store} held in memory and persisted as one JSON blob. Reads stay
+ * synchronous (the engine wants them that way) while writes go through an
+ * async sink — a file, in the app — and are coalesced, since applying a delta
+ * touches the store once per file.
+ *
+ * The blob is only a cache: if it's missing or unparseable the engine just
+ * re-lists the vault and refills it.
+ */
+export class CachedStore implements Store {
+  private data: Record<string, string> = {};
+  private pending = false;
+
+  constructor(
+    private read: () => Promise<string | null>,
+    private write: (blob: string | null) => Promise<void>,
+    /** injected so tests don't wait on a real timer */
+    private defer: (fn: () => void) => void = (fn) => void setTimeout(fn, 500),
+  ) {}
+
+  /** Load the persisted blob. Call before handing the store to the engine. */
+  async load(): Promise<void> {
+    let raw: string | null = null;
+    try {
+      raw = await this.read();
+    } catch {
+      return; // unreadable cache: start empty
+    }
+    if (raw === null) return;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") this.data = parsed as Record<string, string>;
+    } catch {
+      /* corrupt cache: start empty */
+    }
+  }
+
+  get(key: string): string | null {
+    return this.data[key] ?? null;
+  }
+
+  set(key: string, value: string): void {
+    this.data[key] = value;
+    if (this.pending) return;
+    this.pending = true;
+    this.defer(() => {
+      this.pending = false;
+      void this.flush();
+    });
+  }
+
+  flush(): Promise<void> {
+    return this.write(JSON.stringify(this.data)).catch(() => {});
+  }
+
+  /** Drop everything, on disk too (disconnecting from Dropbox). */
+  async clear(): Promise<void> {
+    this.data = {};
+    await this.write(null).catch(() => {});
+  }
+}
+
+/** revs are stored one key per path so a huge vault doesn't need a bespoke
+ *  serialization step on every save. */
 class RevMap {
   constructor(private store: Store) {}
   get(rel: string): string | undefined {

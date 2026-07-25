@@ -105,6 +105,11 @@ function toast(msg: string): void {
   toastTimer = setTimeout(() => (toastEl.hidden = true), 3000);
 }
 
+/** Message of a caught value, without the "Error:" prefix String() adds. */
+function errText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 /* ---------- saving ---------- */
 
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
@@ -688,6 +693,11 @@ async function showSetup(): Promise<void> {
     setupStepsEl.hidden = false;
     $<HTMLElement>("#setup-browse").hidden = true; // no folder picker on Android
     $<HTMLElement>("#setup-dropbox").hidden = false; // offer real-time Dropbox
+    // Authorizing leaves the app, and Android may kill it while it's away, so
+    // the form comes back empty — refill it from what was persisted.
+    const key = dropbox.appKey();
+    if (key) $<HTMLInputElement>("#setup-dropbox-key").value = key;
+    if (dropbox.awaitingCode()) toast("Paste the code from Dropbox to finish connecting");
     setupPath.placeholder = "/storage/emulated/0/Dropbox";
     void refreshSetupChecks();
     return;
@@ -730,7 +740,7 @@ async function changeVault(): Promise<void> {
   if (dropboxSync) {
     dropboxSync.stop();
     dropboxSync = null;
-    dropbox.disconnect();
+    await dropbox.disconnect();
   }
   backend.clearVault();
   started = false;
@@ -784,7 +794,10 @@ $("#setup-dropbox-connect").addEventListener("click", () => {
     toast("Enter your Dropbox app key first");
     return;
   }
-  void dropbox.beginAuth(key).catch((e) => toast("Couldn't open Dropbox: " + e));
+  void dropbox
+    .beginAuth(key)
+    .then(() => toast("Approve in Dropbox, then paste the code it shows you below"))
+    .catch((e) => toast("Couldn't open Dropbox: " + errText(e)));
 });
 
 $("#setup-dropbox-finish").addEventListener("click", () => void finishDropbox());
@@ -801,7 +814,7 @@ async function finishDropbox(): Promise<void> {
     setupEl.hidden = true;
     await startApp();
   } catch (e) {
-    toast("Dropbox connect failed: " + e);
+    toast("Dropbox connect failed: " + errText(e));
   }
 }
 
@@ -920,6 +933,10 @@ async function boot(): Promise<void> {
     currentPath: () => note?.path ?? null,
     recents,
   });
+  // Both read state that outlives the webview, so nothing may decide whether
+  // we're set up until they've landed.
+  await backend.loadVault();
+  await dropbox.load().catch((e) => toast("Couldn't read Dropbox settings: " + errText(e)));
   if (IS_ANDROID && dropbox.isConnected()) {
     try {
       await startDropboxMode();

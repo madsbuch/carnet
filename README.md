@@ -106,7 +106,17 @@ key): create a [Scoped app](https://www.dropbox.com/developers/apps) with the
 `files.content.read` and `files.content.write` scopes, paste the key into the setup screen, and
 authorize. Auth is OAuth2 with PKCE and no redirect — Dropbox shows a code you paste back — so
 there's no server and no secret. The refresh token is stored on-device; only `.md` notes sync
-(attachments still ride whatever folder sync you have). Under the hood this is
+(attachments still ride whatever folder sync you have).
+
+Authorizing sends you to the browser, and Android may kill Carnet while it's in the
+background, so the app comes back to a freshly loaded page. Anything that has to outlive that
+— the notes folder, the app key, the half-finished PKCE handshake, the sync cursor — is
+written to a file in the app's own data directory rather than to the webview's `localStorage`,
+which the system is free to discard. (If the setup screen ever tells you to authorize first,
+that's what it means: press **Authorize Dropbox…** again and use the new code — a code only
+works with the handshake that produced it.)
+
+Under the hood this is
 [`src/client/dropbox.ts`](src/client/dropbox.ts) (API client) and
 [`dropboxsync.ts`](src/client/dropboxsync.ts) (the pull/push engine), both unit-tested in
 [`src/dropbox.test.ts`](src/dropbox.test.ts).

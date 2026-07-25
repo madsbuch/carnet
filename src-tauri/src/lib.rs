@@ -201,6 +201,60 @@ async fn ensure_dir(root: String) -> Result<(), String> {
     fs::create_dir_all(&root).map_err(|e| e.to_string())
 }
 
+/// Path of a small state blob in the app's own data directory. `name` is a
+/// bare file name — no separators, no "..", so this can't address anything
+/// outside that directory.
+fn state_path(app: &tauri::AppHandle, name: &str) -> Result<PathBuf, String> {
+    let ok = !name.is_empty()
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_');
+    if !ok {
+        return Err(format!("bad state name: {name}"));
+    }
+    let dir = tauri::Manager::path(app)
+        .app_local_data_dir()
+        .map_err(|e| e.to_string())?;
+    Ok(dir.join(name))
+}
+
+/// Read a state blob written by `write_state`. Missing file -> None.
+#[tauri::command]
+async fn read_state(app: tauri::AppHandle, name: String) -> Result<Option<String>, String> {
+    let path = state_path(&app, &name)?;
+    match fs::read_to_string(&path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Persist (or, with `content: null`, delete) a state blob. This is where
+/// anything that has to outlive the webview goes — the vault path and the
+/// Dropbox credentials. localStorage is not that place on Android: the
+/// system can drop web storage when the app is backgrounded or restarted,
+/// which is exactly what happens during the Dropbox browser round-trip.
+#[tauri::command]
+async fn write_state(
+    app: tauri::AppHandle,
+    name: String,
+    content: Option<String>,
+) -> Result<(), String> {
+    let path = state_path(&app, &name)?;
+    let Some(content) = content else {
+        return match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
+        };
+    };
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    fs::write(&path, content).map_err(|e| e.to_string())
+}
+
 /// Android glue for the "All files access" permission the vault needs.
 /// Everything JNI runs on the Android main thread via wry's dispatch; a
 /// channel hands the result back to the (async) command thread.
@@ -454,6 +508,8 @@ pub fn run() {
             write_note,
             delete_note,
             ensure_dir,
+            read_state,
+            write_state,
             safe_area_insets,
             storage_ready,
             request_storage_access,

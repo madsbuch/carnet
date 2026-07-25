@@ -1,6 +1,14 @@
 // Wires the pure Dropbox engine (dropbox.ts / dropboxsync.ts) to the running
 // app: OAuth copy-paste flow, token persistence, and a mirror backed by the
 // existing Rust file commands. Android-only; desktop never touches this.
+//
+// Everything here persists through the Rust `read_state`/`write_state`
+// commands rather than localStorage. That matters for the OAuth handshake:
+// authorizing leaves Carnet for the browser, and Android is free to kill the
+// app while it's in the background. When it comes back the webview is a fresh
+// page — and web storage may be gone with it — so a PKCE verifier kept in
+// localStorage can vanish between "Authorize" and pasting the code, leaving
+// the user with a code that can never be redeemed.
 
 import * as backend from "./backend";
 import {
@@ -11,17 +19,33 @@ import {
   randomVerifier,
   type Tokens,
 } from "./dropbox";
-import { DropboxSync, type Mirror, type Store, type SyncHooks } from "./dropboxsync";
+import { CachedStore, DropboxSync, type Mirror, type SyncHooks } from "./dropboxsync";
 
-const APP_KEY = "carnet.dropbox.appKey";
-const TOKENS_KEY = "carnet.dropbox.tokens";
-const VERIFIER_KEY = "carnet.dropbox.verifier";
+const AUTH_FILE = "dropbox.json";
+const SYNC_FILE = "dropbox-sync.json";
+/** where credentials used to live; migrated on first load */
+const OLD_APP_KEY = "carnet.dropbox.appKey";
+const OLD_TOKENS_KEY = "carnet.dropbox.tokens";
 
-/** localStorage as the engine's durable key/value store. */
-const store: Store = {
-  get: (k) => localStorage.getItem(k),
-  set: (k, v) => localStorage.setItem(k, v),
-};
+interface Auth {
+  appKey?: string;
+  tokens?: Tokens;
+  /** PKCE verifier for a handshake that's started but not finished */
+  verifier?: string;
+}
+
+let auth: Auth = {};
+
+async function persist(): Promise<void> {
+  await backend.writeState(AUTH_FILE, JSON.stringify(auth));
+}
+
+/** The engine's cursor + per-file revs. A restart resumes from the cursor
+ *  instead of re-downloading every note. */
+const cache = new CachedStore(
+  () => backend.readState(SYNC_FILE),
+  (blob) => backend.writeState(SYNC_FILE, blob),
+);
 
 /** The mirror is just the plain-folder backend pointed at the mirror dir. */
 const mirror: Mirror = {
@@ -32,48 +56,77 @@ const mirror: Mirror = {
   remove: (rel) => backend.deleteNote(rel),
 };
 
-export function appKey(): string | null {
-  return localStorage.getItem(APP_KEY);
+/** Boot step: load persisted credentials, migrating a connection made before
+ *  they moved out of localStorage. Must run before {@link isConnected}. */
+export async function load(): Promise<void> {
+  const raw = await backend.readState(AUTH_FILE).catch(() => null);
+  if (raw) {
+    try {
+      auth = JSON.parse(raw) as Auth;
+    } catch {
+      auth = {};
+    }
+  } else {
+    const key = localStorage.getItem(OLD_APP_KEY);
+    const tokens = localStorage.getItem(OLD_TOKENS_KEY);
+    try {
+      if (key || tokens) {
+        auth = {
+          appKey: key ?? undefined,
+          tokens: tokens ? (JSON.parse(tokens) as Tokens) : undefined,
+        };
+        await persist();
+      }
+    } catch {
+      auth = {}; // nothing usable to migrate — the user reconnects
+    }
+  }
+  await cache.load();
 }
 
-export function setAppKey(key: string): void {
-  localStorage.setItem(APP_KEY, key.trim());
+export function appKey(): string | null {
+  return auth.appKey ?? null;
 }
 
 export function isConnected(): boolean {
-  return appKey() !== null && localStorage.getItem(TOKENS_KEY) !== null;
+  return auth.appKey !== undefined && auth.tokens !== undefined;
 }
 
-function loadTokens(): Tokens | null {
-  const raw = localStorage.getItem(TOKENS_KEY);
-  return raw ? (JSON.parse(raw) as Tokens) : null;
-}
-
-function saveTokens(t: Tokens): void {
-  localStorage.setItem(TOKENS_KEY, JSON.stringify(t));
+/** Whether {@link beginAuth} ran and is waiting for a code to be pasted. */
+export function awaitingCode(): boolean {
+  return auth.verifier !== undefined;
 }
 
 /** Step 1 of connecting: open Dropbox's consent page. The user will get an
- *  authorization code to paste back into {@link completeAuth}. */
+ *  authorization code to paste back into {@link completeAuth}. The verifier is
+ *  on disk before we hand off to the browser, since the app may not survive
+ *  being in the background while the user is over there. */
 export async function beginAuth(key: string): Promise<void> {
-  setAppKey(key);
+  const appKey = key.trim();
   const verifier = randomVerifier();
-  localStorage.setItem(VERIFIER_KEY, verifier);
-  const url = authorizeUrl(key, await challengeFor(verifier));
-  await backend.openUrl(url);
+  const challenge = await challengeFor(verifier);
+  auth = { ...auth, appKey, verifier };
+  await persist();
+  await backend.openUrl(authorizeUrl(appKey, challenge));
 }
 
 /** Step 2: exchange the pasted code for tokens. */
 export async function completeAuth(code: string): Promise<void> {
-  const key = appKey();
-  const verifier = localStorage.getItem(VERIFIER_KEY);
-  if (!key || !verifier) throw new Error("start the Dropbox connection first");
-  const tokens = await exchangeCode(key, code.trim(), verifier);
-  saveTokens(tokens);
-  localStorage.removeItem(VERIFIER_KEY);
+  const { appKey, verifier } = auth;
+  if (!appKey || !verifier) {
+    throw new Error(
+      'tap "Authorize Dropbox…" first, then paste the code that Dropbox shows you',
+    );
+  }
+  const tokens = await exchangeCode(appKey, code.trim(), verifier);
+  auth = { appKey, tokens };
+  await persist();
 }
 
-export function disconnect(): void {
+export async function disconnect(): Promise<void> {
+  auth = {};
+  await backend.writeState(AUTH_FILE, null).catch(() => {});
+  await cache.clear();
   for (const k of Object.keys(localStorage)) {
     if (k.startsWith("carnet.dropbox.")) localStorage.removeItem(k);
   }
@@ -91,23 +144,24 @@ export function mirrorDir(): Promise<string> {
  * caller can push saves and stop it later.
  */
 export async function start(hooks: SyncHooks): Promise<DropboxSync> {
-  const key = appKey();
-  const tokens = loadTokens();
-  if (!key || !tokens) throw new Error("Dropbox not connected");
+  const { appKey, tokens } = auth;
+  if (!appKey || !tokens) throw new Error("Dropbox not connected");
 
   const dir = await mirrorDir();
   await backend.ensureDir(dir);
   backend.setVault(dir);
 
-  const client = new DropboxClient(tokens, key);
+  const client = new DropboxClient(tokens, appKey);
   const persisting: SyncHooks = {
     onChanged: () => {
-      saveTokens(client.currentTokens()); // capture refreshed access token/expiry
+      // capture the refreshed access token/expiry
+      auth = { ...auth, tokens: client.currentTokens() };
+      void persist().catch(() => {});
       hooks.onChanged();
     },
     onError: hooks.onError,
   };
-  const sync = new DropboxSync(client, mirror, store, persisting);
+  const sync = new DropboxSync(client, mirror, cache, persisting);
   await sync.initialSync();
   void sync.run();
   return sync;
