@@ -105,10 +105,15 @@
       <div class="setup-or">or</div>
       <div class="step-title">Real-time sync (connect Dropbox)</div>
       <p>Skip the folder-sync app: let Carnet talk to Dropbox directly so changes
-        appear within seconds. Paste your Dropbox app key (create one at
-        dropbox.com/developers, Scoped app, with <code>files.content.read</code>
-        and <code>files.content.write</code>), then authorize.</p>
+        appear within seconds. Create a Dropbox app at dropbox.com/developers
+        &mdash; a <b>Scoped app</b> with <b>App folder</b> access and the
+        <code>files.metadata.read</code>, <code>files.content.read</code> and
+        <code>files.content.write</code> scopes &mdash; then paste its app key.
+        Your notes live in the app's own folder (<code>/Apps/&lt;your app&gt;</code>),
+        so Carnet can never touch the rest of your Dropbox. Pick <b>Full Dropbox</b>
+        instead only if you need to sync an existing folder in place.</p>
       <input id="setup-dropbox-key" type="text" placeholder="Dropbox app key" autocomplete="off" spellcheck="false" />
+      <input id="setup-dropbox-folder" type="text" placeholder="Subfolder to sync, e.g. /notes (blank = whole app folder)" autocomplete="off" spellcheck="false" />
       <button id="setup-dropbox-connect" class="step-btn">Authorize Dropbox&hellip;</button>
       <input id="setup-dropbox-code" type="text" placeholder="Paste the code from Dropbox" autocomplete="off" spellcheck="false" />
       <button id="setup-dropbox-finish">Finish &amp; sync</button>

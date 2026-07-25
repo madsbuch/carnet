@@ -435,11 +435,12 @@ body.sidebar-open #sidebar { transform: none; }
   z-index: 60;
   background: var(--bg);
   display: flex;
-  align-items: center;
-  justify-content: center;
+  /* scroll when the panel is taller than the screen; auto-margins on the panel
+     still center it when it fits. align-items:center would clip a tall panel. */
+  overflow-y: auto;
   padding: calc(24px + var(--safe-top)) 24px calc(24px + var(--safe-bottom));
 }
-#setup-panel { max-width: 27rem; width: 100%; }
+#setup-panel { max-width: 27rem; width: 100%; margin: auto; }
 #setup-panel h2 { margin: 0 0 4px; }
 #setup-panel p { color: var(--muted); font-size: 14px; }
 #setup-row { display: flex; gap: 8px; margin: 16px 0 8px; }
@@ -475,6 +476,7 @@ body.sidebar-open #sidebar { transform: none; }
 #setup-dropbox .step-title { font-weight: 600; margin-bottom: 4px; }
 #setup-dropbox code { font-size: 12px; }
 #setup-dropbox-key,
+#setup-dropbox-folder,
 #setup-dropbox-code {
   width: 100%;
   margin: 8px 0;

@@ -137,6 +137,10 @@ async function doSave(): Promise<void> {
   if (!note || !dirty) return;
   const n = note;
   const contentAtSave = n.content;
+  // Snapshot the Dropbox base rev BEFORE writing the mirror, so if the pull
+  // loop moves the rev between here and the upload, the push conflicts (and
+  // prompts) instead of silently overwriting the other device's change.
+  const baseRev = dropboxSync?.revOf(n.path);
   try {
     let res = await backend.writeNote(n.path, contentAtSave, n.mtime, loadedHash ?? undefined);
     if (res.status === "conflict") {
@@ -169,7 +173,7 @@ async function doSave(): Promise<void> {
       updateDirty();
     }
     invalidate();
-    await pushToDropbox(n, contentAtSave);
+    await pushToDropbox(n, contentAtSave, baseRev);
   } catch (e) {
     toast("Save failed: " + e);
   }
@@ -177,11 +181,16 @@ async function doSave(): Promise<void> {
 
 /** In Dropbox mode, push a saved note upstream. A rev conflict (the note also
  *  changed on Dropbox) reuses the same keep-mine / take-theirs choice as the
- *  on-disk conflict path. */
-async function pushToDropbox(n: backend.Note, contentAtSave: string): Promise<void> {
+ *  on-disk conflict path. `baseRev` is the rev snapshotted before the mirror
+ *  write, so a mid-save pull surfaces as a conflict here. */
+async function pushToDropbox(
+  n: backend.Note,
+  contentAtSave: string,
+  baseRev: string | undefined,
+): Promise<void> {
   if (!dropboxSync) return;
   try {
-    const push = await dropboxSync.pushNote(n.path, contentAtSave);
+    const push = await dropboxSync.pushNote(n.path, contentAtSave, baseRev);
     if (push.status !== "conflict") return;
     const keepMine = await ask(
       "This note also changed in Dropbox. Which version should win?",
@@ -189,7 +198,8 @@ async function pushToDropbox(n: backend.Note, contentAtSave: string): Promise<vo
     );
     if (keepMine) {
       await backend.writeNote(n.path, contentAtSave); // mirror = mine
-      await dropboxSync.pushNote(n.path, contentAtSave); // upload wins the rev now
+      // re-push based on the server rev we just pulled, so this write wins
+      await dropboxSync.pushNote(n.path, contentAtSave, dropboxSync.revOf(n.path));
     } else if (note === n) {
       n.content = push.content;
       const fresh = await backend.readNote(n.path).catch(() => null);
@@ -698,6 +708,8 @@ async function showSetup(): Promise<void> {
     // the form comes back empty — refill it from what was persisted.
     const key = dropbox.appKey();
     if (key) $<HTMLInputElement>("#setup-dropbox-key").value = key;
+    const dbFolder = dropbox.folder();
+    if (dbFolder) $<HTMLInputElement>("#setup-dropbox-folder").value = dbFolder;
     if (dropbox.awaitingCode()) toast("Paste the code from Dropbox to finish connecting");
     setupPath.placeholder = "/storage/emulated/0/Dropbox";
     void refreshSetupChecks();
@@ -829,6 +841,9 @@ async function finishDropbox(): Promise<void> {
   btn.disabled = true;
   btn.textContent = "Connecting…";
   try {
+    // Persist the folder first so completeAuth (which rebuilds auth) keeps it,
+    // and so a retry that skips completeAuth still applies any change.
+    await dropbox.setFolder($<HTMLInputElement>("#setup-dropbox-folder").value);
     if (!authorized) {
       await dropbox.completeAuth(code);
       codeEl.value = ""; // spent now, whatever happens next
@@ -950,6 +965,12 @@ async function startDropboxMode(): Promise<void> {
       void refreshFromDisk();
     },
     onError: (m) => toast(m),
+    onAuthExpired: () => {
+      // Loop has already stopped. Drop the handle so saves stay local (no
+      // doomed upload on every keystroke) until the user reconnects.
+      toast("Dropbox access expired — reconnect from the folder button to keep syncing", 12_000);
+      dropboxSync = null;
+    },
   });
 }
 

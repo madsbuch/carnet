@@ -17,6 +17,7 @@ import {
   authorizeUrl,
   challengeFor,
   exchangeCode,
+  normalizeFolder,
   randomVerifier,
   type Tokens,
 } from "./dropbox";
@@ -31,6 +32,8 @@ const OLD_TOKENS_KEY = "carnet.dropbox.tokens";
 interface Auth {
   appKey?: string;
   tokens?: Tokens;
+  /** Dropbox folder to sync, normalized ("" = whole account / app folder). */
+  folder?: string;
   /**
    * PKCE verifiers for handshakes that were started but never finished, oldest
    * first. There can be several: tapping "Authorize" again issues a code bound
@@ -100,6 +103,17 @@ export function appKey(): string | null {
   return auth.appKey ?? null;
 }
 
+/** The Dropbox folder to sync, normalized ("" = whole account / app folder). */
+export function folder(): string {
+  return normalizeFolder(auth.folder ?? "");
+}
+
+/** Persisted alongside the credentials so it survives an app kill. */
+export async function setFolder(input: string): Promise<void> {
+  auth = { ...auth, folder: normalizeFolder(input) };
+  await persist();
+}
+
 export function isConnected(): boolean {
   return auth.appKey !== undefined && auth.tokens !== undefined;
 }
@@ -146,7 +160,7 @@ export async function completeAuth(code: string): Promise<void> {
   for (const verifier of verifiers) {
     try {
       const tokens = await exchangeCode(appKey, clean, verifier);
-      auth = { appKey, tokens };
+      auth = { appKey, tokens, folder: auth.folder }; // keep folder, drop verifiers
       await persist();
       return;
     } catch (e) {
@@ -200,7 +214,13 @@ export async function start(hooks: SyncHooks): Promise<DropboxSync> {
   await backend.ensureDir(dir);
   backend.setVault(dir);
 
-  const client = new DropboxClient(tokens, appKey);
+  // Self-heal: if the mirror was wiped (storage cleared) but the cache still
+  // holds a cursor + revs, a normal sync would skip re-downloading everything
+  // (the rev guard). Drop the cache so the initial sync repopulates.
+  const notes = await backend.listNotes().catch(() => [] as string[]);
+  if (notes.length === 0 && cache.get("carnet.dropbox.cursor") !== null) await cache.clear();
+
+  const client = new DropboxClient(tokens, appKey, folder());
   const persisting: SyncHooks = {
     onChanged: () => {
       // capture the refreshed access token/expiry
@@ -209,9 +229,17 @@ export async function start(hooks: SyncHooks): Promise<DropboxSync> {
       hooks.onChanged();
     },
     onError: hooks.onError,
+    onAuthExpired: hooks.onAuthExpired,
   };
   const sync = new DropboxSync(client, mirror, cache, persisting);
-  await sync.initialSync();
+  // Try to populate the mirror before the caller lists it, but don't let a
+  // failure (e.g. offline) abort startup: the loop retries the initial sync
+  // itself and self-heals instead of leaving a dead, no-sync session.
+  try {
+    await sync.initialSync();
+  } catch {
+    /* the loop will retry from scratch (no cursor yet) */
+  }
   void sync.run();
   return sync;
 }
