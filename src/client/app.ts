@@ -98,11 +98,12 @@ async function getGraph(): Promise<GraphData> {
 /* ---------- toast ---------- */
 
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
-function toast(msg: string): void {
+/** `ms` buys reading time for the rare message that explains what to do. */
+function toast(msg: string, ms = 3000): void {
   toastEl.textContent = msg;
   toastEl.hidden = false;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (toastEl.hidden = true), 3000);
+  toastTimer = setTimeout(() => (toastEl.hidden = true), ms);
 }
 
 /** Message of a caught value, without the "Error:" prefix String() adds. */
@@ -794,27 +795,54 @@ $("#setup-dropbox-connect").addEventListener("click", () => {
     toast("Enter your Dropbox app key first");
     return;
   }
+  // Whatever is in the code box belongs to the handshake being replaced, and a
+  // spent code re-pasted is exactly what Dropbox rejects as invalid_grant.
+  $<HTMLInputElement>("#setup-dropbox-code").value = "";
   void dropbox
     .beginAuth(key)
-    .then(() => toast("Approve in Dropbox, then paste the code it shows you below"))
-    .catch((e) => toast("Couldn't open Dropbox: " + errText(e)));
+    .then(() => toast("Approve in Dropbox, then paste the code it shows you below", 6000))
+    .catch((e) => toast("Couldn't open Dropbox: " + errText(e), 9000));
 });
 
 $("#setup-dropbox-finish").addEventListener("click", () => void finishDropbox());
 
+/** Guards the finish button: the exchange takes a moment on mobile data, and a
+ *  second tap would send the same single-use code again — the first attempt
+ *  wins and the retry comes back as invalid_grant over a connection that
+ *  actually worked. */
+let connecting = false;
+
 async function finishDropbox(): Promise<void> {
-  const code = $<HTMLInputElement>("#setup-dropbox-code").value.trim();
-  if (!code) {
+  if (connecting) return;
+  const codeEl = $<HTMLInputElement>("#setup-dropbox-code");
+  const code = codeEl.value.trim();
+  // Already authorized means a previous attempt got the tokens and only the
+  // first sync failed — retry that rather than spending another code.
+  const authorized = dropbox.isConnected();
+  if (!authorized && !code) {
     toast("Paste the code from Dropbox first");
     return;
   }
+  const btn = $<HTMLButtonElement>("#setup-dropbox-finish");
+  const label = btn.textContent;
+  connecting = true;
+  btn.disabled = true;
+  btn.textContent = "Connecting…";
   try {
-    await dropbox.completeAuth(code);
+    if (!authorized) {
+      await dropbox.completeAuth(code);
+      codeEl.value = ""; // spent now, whatever happens next
+    }
+    toast("Connected — fetching your notes…", 10_000);
     await startDropboxMode();
     setupEl.hidden = true;
     await startApp();
   } catch (e) {
-    toast("Dropbox connect failed: " + errText(e));
+    toast("Dropbox connect failed: " + errText(e), 12_000);
+  } finally {
+    connecting = false;
+    btn.disabled = false;
+    btn.textContent = label;
   }
 }
 

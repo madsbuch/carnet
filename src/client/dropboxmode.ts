@@ -13,6 +13,7 @@
 import * as backend from "./backend";
 import {
   DropboxClient,
+  DropboxError,
   authorizeUrl,
   challengeFor,
   exchangeCode,
@@ -30,9 +31,19 @@ const OLD_TOKENS_KEY = "carnet.dropbox.tokens";
 interface Auth {
   appKey?: string;
   tokens?: Tokens;
-  /** PKCE verifier for a handshake that's started but not finished */
+  /**
+   * PKCE verifiers for handshakes that were started but never finished, oldest
+   * first. There can be several: tapping "Authorize" again issues a code bound
+   * to the new challenge, but the code the user actually pastes may be the one
+   * still sitting in the older browser tab. Keeping the last few means the
+   * paste works either way instead of failing as `invalid_grant`.
+   */
+  verifiers?: string[];
+  /** single-verifier layout this replaced */
   verifier?: string;
 }
+
+const KEEP_VERIFIERS = 3;
 
 let auth: Auth = {};
 
@@ -59,6 +70,7 @@ const mirror: Mirror = {
 /** Boot step: load persisted credentials, migrating a connection made before
  *  they moved out of localStorage. Must run before {@link isConnected}. */
 export async function load(): Promise<void> {
+  auth = {}; // whatever is on disk is the truth, including nothing
   const raw = await backend.readState(AUTH_FILE).catch(() => null);
   if (raw) {
     try {
@@ -92,9 +104,16 @@ export function isConnected(): boolean {
   return auth.appKey !== undefined && auth.tokens !== undefined;
 }
 
+/** Pending verifiers, newest first — the order worth trying a code against. */
+function pending(): string[] {
+  const list = [...(auth.verifiers ?? [])];
+  if (auth.verifier) list.push(auth.verifier); // carried over from the old layout
+  return list.reverse();
+}
+
 /** Whether {@link beginAuth} ran and is waiting for a code to be pasted. */
 export function awaitingCode(): boolean {
-  return auth.verifier !== undefined;
+  return pending().length > 0;
 }
 
 /** Step 1 of connecting: open Dropbox's consent page. The user will get an
@@ -105,22 +124,52 @@ export async function beginAuth(key: string): Promise<void> {
   const appKey = key.trim();
   const verifier = randomVerifier();
   const challenge = await challengeFor(verifier);
-  auth = { ...auth, appKey, verifier };
+  const verifiers = [...pending().reverse(), verifier].slice(-KEEP_VERIFIERS);
+  auth = { ...auth, appKey, verifiers, verifier: undefined };
   await persist();
   await backend.openUrl(authorizeUrl(appKey, challenge));
 }
 
-/** Step 2: exchange the pasted code for tokens. */
+/**
+ * Step 2: exchange the pasted code for tokens. Dropbox shows the code on a web
+ * page, so what arrives here has been through a mobile copy-paste: strip any
+ * whitespace it picked up on the way.
+ */
 export async function completeAuth(code: string): Promise<void> {
-  const { appKey, verifier } = auth;
-  if (!appKey || !verifier) {
-    throw new Error(
-      'tap "Authorize Dropbox…" first, then paste the code that Dropbox shows you',
-    );
+  const appKey = auth.appKey;
+  const verifiers = pending();
+  if (!appKey || verifiers.length === 0) {
+    throw new Error('tap "Authorize Dropbox…" first, then paste the code Dropbox shows you');
   }
-  const tokens = await exchangeCode(appKey, code.trim(), verifier);
-  auth = { appKey, tokens };
-  await persist();
+  const clean = code.replace(/\s+/g, "");
+  let failure: unknown;
+  for (const verifier of verifiers) {
+    try {
+      const tokens = await exchangeCode(appKey, clean, verifier);
+      auth = { appKey, tokens };
+      await persist();
+      return;
+    } catch (e) {
+      if (!isBadGrant(e)) throw e; // network/server trouble: not the code's fault
+      failure ??= e;
+    }
+  }
+  throw badGrantHelp(failure);
+}
+
+/** Dropbox's "that code is no good" response, as opposed to a transport error. */
+function isBadGrant(e: unknown): boolean {
+  return e instanceof DropboxError && e.status === 400 && e.body.includes("invalid_grant");
+}
+
+/** invalid_grant covers expired, already-used, and wrong-handshake codes, and
+ *  the raw JSON says none of that usefully. */
+function badGrantHelp(e: unknown): Error {
+  if (!isBadGrant(e)) return e instanceof Error ? e : new Error(String(e));
+  return new Error(
+    "Dropbox rejected that code. Codes are single-use and expire quickly — tap " +
+      '"Authorize Dropbox…" for a fresh one, copy the whole code, and paste it straight away.',
+  );
 }
 
 export async function disconnect(): Promise<void> {

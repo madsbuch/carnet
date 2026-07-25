@@ -570,8 +570,14 @@ body.sidebar-open #sidebar { transform: none; }
   z-index: 100; /* above every overlay — errors must never be invisible */
   background: var(--fg);
   color: var(--bg);
-  padding: 8px 16px;
-  border-radius: 999px;
+  padding: 10px 16px;
+  /* a pill for the usual one-liner; the ones that explain what went wrong run
+     several lines, and a 999px radius turns those into an unreadable blob */
+  border-radius: 16px;
+  max-width: min(32rem, calc(100vw - 32px));
   font-size: 13px;
+  line-height: 1.45;
+  text-align: center;
+  text-wrap: pretty;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
 }
