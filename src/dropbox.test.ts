@@ -320,6 +320,42 @@ describe("DropboxSync", () => {
   });
 });
 
+describe("the ambient fetch", () => {
+  /** Swap in a receiver-recording global fetch for the duration of `body`. */
+  async function withGlobalFetch(body: () => Promise<void>): Promise<unknown> {
+    const real = globalThis.fetch;
+    let receiver: unknown = "never called";
+    globalThis.fetch = function (this: unknown) {
+      receiver = this;
+      return Promise.resolve(json({ entries: [], cursor: "C", has_more: false }));
+    } as unknown as typeof fetch;
+    try {
+      await body();
+    } finally {
+      globalThis.fetch = real;
+    }
+    return receiver;
+  }
+
+  // The browser's fetch throws "Illegal invocation" when it's called as a
+  // method of anything but the window, so a client that stores it bare and
+  // calls this.fetch(...) fails on its first request — after the token
+  // exchange has already succeeded, which is a miserable place to find out.
+  test("is called on its own, not as a method of the client", async () => {
+    const receiver = await withGlobalFetch(async () => {
+      await new DropboxClient(tokens(), "APPKEY").listFolder("");
+    });
+    expect(receiver === undefined || receiver === globalThis).toBe(true);
+  });
+
+  test("the same goes for the unauthenticated longpoll", async () => {
+    const receiver = await withGlobalFetch(async () => {
+      await new DropboxClient(tokens(), "APPKEY").longpoll("C");
+    });
+    expect(receiver === undefined || receiver === globalThis).toBe(true);
+  });
+});
+
 describe("CachedStore", () => {
   /** A blob "file" plus a defer that runs the flush on demand. */
   function harness(initial: string | null = null) {

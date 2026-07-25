@@ -13,7 +13,9 @@ const CONTENT = "https://content.dropboxapi.com/2";
 // The longpoll endpoint lives on a separate host and takes NO auth header.
 const NOTIFY = "https://notify.dropboxapi.com/2";
 
-export type FetchLike = typeof fetch;
+/** Just the call — not the extras hung off the global, which nothing here
+ *  uses and a wrapper or a test double can't supply. */
+export type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 export interface Tokens {
   accessToken: string;
@@ -119,7 +121,10 @@ export class DropboxClient {
     /** injectable clock so token-expiry logic is testable */
     private now: () => number = () => Date.now(),
   ) {
-    this.fetch = fetchImpl ?? fetch;
+    // Wrapped, not stored bare: every call below is `this.fetch(...)`, which
+    // hands the browser's fetch a DropboxClient as its receiver — and the
+    // native one refuses that with "Illegal invocation".
+    this.fetch = fetchImpl ?? ((input, init) => fetch(input, init));
   }
 
   currentTokens(): Tokens {
