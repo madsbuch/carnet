@@ -170,7 +170,10 @@ export class DropboxClient {
     /** injectable clock so token-expiry logic is testable */
     private now: () => number = () => Date.now(),
   ) {
-    this.fetch = fetchImpl ?? fetch;
+    // Bind the default: stored on an instance and called as `this.fetch(...)`,
+    // the native fetch would get the client as its receiver, and the browser
+    // rejects that with "Illegal invocation".
+    this.fetch = fetchImpl ?? globalThis.fetch.bind(globalThis);
   }
 
   currentTokens(): Tokens {

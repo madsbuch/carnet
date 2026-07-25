@@ -159,6 +159,26 @@ describe("DropboxClient", () => {
     expect(c.currentTokens().accessToken).toBe("NEW");
   });
 
+  test("the default fetch is called with the global as its receiver", async () => {
+    // Browsers reject `fetch` invoked with anything but Window/WorkerGlobalScope
+    // as the receiver ("Illegal invocation"), which is what happens if the
+    // default is stored unbound on the instance and called as `this.fetch(...)`.
+    // Bun's fetch does not enforce that, so stand in a receiver-checking one.
+    const real = globalThis.fetch;
+    globalThis.fetch = function (this: unknown) {
+      if (this !== globalThis && this !== undefined) {
+        throw new TypeError("Failed to execute 'fetch' on 'Window': Illegal invocation");
+      }
+      return Promise.resolve(json({ entries: [], cursor: "C", has_more: false }));
+    } as unknown as typeof fetch;
+    try {
+      const c = new DropboxClient(tokens(), "APPKEY", "");
+      expect(await c.listFolder()).toEqual({ deltas: [], cursor: "C", hasMore: false });
+    } finally {
+      globalThis.fetch = real;
+    }
+  });
+
   test("list_folder keeps only markdown files and deletions", async () => {
     const { fetch } = fakeFetch(() =>
       json({
