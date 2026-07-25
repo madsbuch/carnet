@@ -5,6 +5,10 @@
 // Auth is OAuth2 with PKCE and no redirect URI: Dropbox shows the user an
 // authorization code to copy back, so the app needs no registered callback and
 // no server. `token_access_type=offline` yields a refresh token we keep.
+//
+// The client is scoped to one Dropbox folder (`basePath`, e.g. "/notes", or ""
+// for the whole account). Everything above this module works in vault-relative
+// paths ("projects/a.md"); the client maps those to/from Dropbox paths.
 
 const AUTHORIZE = "https://www.dropbox.com/oauth2/authorize";
 const TOKEN = "https://api.dropboxapi.com/oauth2/token";
@@ -20,13 +24,6 @@ export interface Tokens {
   refreshToken: string;
   /** epoch ms after which accessToken should be refreshed */
   expiresAt: number;
-}
-
-/** A file that exists on Dropbox (added or modified since the cursor). */
-export interface RemoteFile {
-  /** vault-relative path, e.g. "projects/carnet.md" (no leading slash) */
-  rel: string;
-  rev: string;
 }
 
 /** One change from a list_folder delta. */
@@ -73,14 +70,26 @@ export function authorizeUrl(appKey: string, challenge: string): string {
 
 /* ---------------- path mapping ---------------- */
 
-/** Dropbox "/A/B.md" -> vault-relative "A/B.md". Root "" stays "". */
-export function toRel(dropboxPath: string): string {
-  return dropboxPath.replace(/^\/+/, "");
+/** Normalize a user-entered folder to a Dropbox base: "" (whole account) or a
+ *  leading-slash, no-trailing-slash path like "/notes". */
+export function normalizeFolder(input: string): string {
+  const t = input.trim().replace(/\/+$/, "");
+  if (!t || t === "/") return "";
+  return t.startsWith("/") ? t : "/" + t;
 }
 
-/** vault-relative "A/B.md" -> Dropbox "/A/B.md". */
-export function toDropbox(rel: string): string {
-  return "/" + rel.replace(/^\/+/, "");
+/** Dropbox "/notes/a/b.md" -> vault-relative "a/b.md" for base "/notes". */
+export function toRel(dropboxPath: string, base = ""): string {
+  const b = base.replace(/\/+$/, "");
+  let p = dropboxPath;
+  if (b && p.toLowerCase().startsWith(b.toLowerCase())) p = p.slice(b.length);
+  return p.replace(/^\/+/, "");
+}
+
+/** vault-relative "a/b.md" -> Dropbox "/notes/a/b.md" for base "/notes". */
+export function toDropbox(rel: string, base = ""): string {
+  const b = base.replace(/\/+$/, "");
+  return b + "/" + rel.replace(/^\/+/, "");
 }
 
 export function isMarkdown(rel: string): boolean {
@@ -93,6 +102,8 @@ export class DropboxError extends Error {
   constructor(
     readonly status: number,
     readonly body: string,
+    /** honored on 429/503 responses; 0 when the server didn't ask us to wait */
+    readonly retryAfterMs = 0,
   ) {
     super(`dropbox ${status}: ${body}`);
     this.name = "DropboxError";
@@ -107,6 +118,44 @@ export class WriteConflict extends Error {
   }
 }
 
+/** Auth is unrecoverable without re-linking: the refresh token was revoked or
+ *  expired, or the access token was rejected. The caller should stop and ask
+ *  the user to reconnect rather than retry forever. */
+export class DropboxAuthError extends DropboxError {
+  constructor(status: number, body: string) {
+    super(status, body);
+    this.name = "DropboxAuthError";
+  }
+}
+
+/** Dropbox invalidated our list_folder cursor (long inactivity, account
+ *  change). The caller must discard the cursor and re-list from scratch. */
+export class CursorReset extends DropboxError {
+  constructor(status: number, body: string) {
+    super(status, body);
+    this.name = "CursorReset";
+  }
+}
+
+function isReset(body: string): boolean {
+  try {
+    const j = JSON.parse(body) as { error?: { ".tag"?: string }; error_summary?: string };
+    if (j.error?.[".tag"] === "reset") return true;
+    return typeof j.error_summary === "string" && j.error_summary.startsWith("reset");
+  } catch {
+    return false;
+  }
+}
+
+async function errFrom(res: Response): Promise<DropboxError> {
+  const body = await res.text();
+  const ra = Number(res.headers.get("retry-after"));
+  const retryAfterMs = Number.isFinite(ra) && ra > 0 ? ra * 1000 : 0;
+  if (res.status === 401) return new DropboxAuthError(res.status, body);
+  if (isReset(body)) return new CursorReset(res.status, body);
+  return new DropboxError(res.status, body, retryAfterMs);
+}
+
 /* ---------------- client ---------------- */
 
 export class DropboxClient {
@@ -115,6 +164,8 @@ export class DropboxClient {
   constructor(
     private tokens: Tokens,
     private appKey: string,
+    /** Dropbox folder this client is scoped to; "" is the whole account. */
+    private basePath = "",
     fetchImpl?: FetchLike,
     /** injectable clock so token-expiry logic is testable */
     private now: () => number = () => Date.now(),
@@ -139,7 +190,12 @@ export class DropboxClient {
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body,
     });
-    if (!res.ok) throw new DropboxError(res.status, await res.text());
+    if (!res.ok) {
+      // A 400 here (invalid_grant / invalid_client) means the refresh token is
+      // dead — no amount of retrying fixes it, so surface it as an auth error.
+      const e = await errFrom(res);
+      throw res.status === 400 ? new DropboxAuthError(res.status, e.body) : e;
+    }
     const json = (await res.json()) as { access_token: string; expires_in: number };
     this.tokens = {
       ...this.tokens,
@@ -159,35 +215,43 @@ export class DropboxClient {
       },
       body: JSON.stringify(arg),
     });
-    if (!res.ok) throw new DropboxError(res.status, await res.text());
+    if (!res.ok) throw await errFrom(res);
     return (await res.json()) as T;
   }
 
-  /** Initial recursive listing; returns the first page + cursor. */
-  listFolder(root = ""): Promise<ListPage> {
+  /** Initial recursive listing of the scoped folder; first page + cursor. */
+  listFolder(): Promise<ListPage> {
     return this.rpc<RawListResult>("/files/list_folder", {
-      path: root,
+      path: this.basePath,
       recursive: true,
       include_deleted: false,
-    }).then(parseListResult);
+    }).then((r) => parseListResult(r, this.basePath));
   }
 
   listFolderContinue(cursor: string): Promise<ListPage> {
-    return this.rpc<RawListResult>("/files/list_folder/continue", { cursor }).then(parseListResult);
+    return this.rpc<RawListResult>("/files/list_folder/continue", { cursor }).then((r) =>
+      parseListResult(r, this.basePath),
+    );
   }
 
   /**
    * Block until Dropbox reports a change under `cursor` (or `timeout` seconds
-   * elapse). Unauthenticated by design. Returns whether anything changed and an
+   * elapse). Unauthenticated by design. `signal` lets a caller abort the wait
+   * immediately (e.g. on shutdown). Returns whether anything changed and an
    * optional server-requested backoff.
    */
-  async longpoll(cursor: string, timeout = 480): Promise<{ changed: boolean; backoff: number }> {
+  async longpoll(
+    cursor: string,
+    timeout = 480,
+    signal?: AbortSignal,
+  ): Promise<{ changed: boolean; backoff: number }> {
     const res = await this.fetch(`${NOTIFY}/files/list_folder/longpoll`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ cursor, timeout }),
+      signal,
     });
-    if (!res.ok) throw new DropboxError(res.status, await res.text());
+    if (!res.ok) throw await errFrom(res);
     const json = (await res.json()) as { changes: boolean; backoff?: number };
     return { changed: json.changes, backoff: json.backoff ?? 0 };
   }
@@ -199,10 +263,10 @@ export class DropboxClient {
       method: "POST",
       headers: {
         authorization: `Bearer ${token}`,
-        "Dropbox-API-Arg": apiArg({ path: toDropbox(rel) }),
+        "Dropbox-API-Arg": apiArg({ path: toDropbox(rel, this.basePath) }),
       },
     });
-    if (!res.ok) throw new DropboxError(res.status, await res.text());
+    if (!res.ok) throw await errFrom(res);
     const meta = JSON.parse(res.headers.get("Dropbox-API-Result") ?? "{}") as { rev?: string };
     return { content: await res.text(), rev: meta.rev ?? "" };
   }
@@ -221,7 +285,12 @@ export class DropboxClient {
       headers: {
         authorization: `Bearer ${token}`,
         "content-type": "application/octet-stream",
-        "Dropbox-API-Arg": apiArg({ path: toDropbox(rel), mode, autorename: false, mute: true }),
+        "Dropbox-API-Arg": apiArg({
+          path: toDropbox(rel, this.basePath),
+          mode,
+          autorename: false,
+          mute: true,
+        }),
       },
       body: content,
     });
@@ -230,7 +299,7 @@ export class DropboxClient {
       if (text.includes("conflict")) throw new WriteConflict();
       throw new DropboxError(409, text);
     }
-    if (!res.ok) throw new DropboxError(res.status, await res.text());
+    if (!res.ok) throw await errFrom(res);
     const json = (await res.json()) as { rev: string };
     return { rev: json.rev };
   }
@@ -256,7 +325,7 @@ export async function exchangeCode(
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body,
   });
-  if (!res.ok) throw new DropboxError(res.status, await res.text());
+  if (!res.ok) throw await errFrom(res);
   const json = (await res.json()) as {
     access_token: string;
     refresh_token: string;
@@ -283,11 +352,11 @@ interface RawListResult {
   has_more: boolean;
 }
 
-function parseListResult(r: RawListResult): ListPage {
+function parseListResult(r: RawListResult, base: string): ListPage {
   const deltas: Delta[] = [];
   for (const e of r.entries) {
     const path = e.path_display ?? e.path_lower ?? "";
-    const rel = toRel(path);
+    const rel = toRel(path, base);
     if (!isMarkdown(rel)) continue; // notes only, matching the folder backend
     if (e[".tag"] === "file") deltas.push({ kind: "file", rel, rev: e.rev ?? "" });
     else if (e[".tag"] === "deleted") deltas.push({ kind: "deleted", rel });

@@ -6,7 +6,10 @@
 // unit-tested without Tauri or the network.
 
 import {
+  CursorReset,
+  DropboxAuthError,
   DropboxClient,
+  DropboxError,
   WriteConflict,
   isMarkdown,
   type Delta,
@@ -20,10 +23,11 @@ export interface Mirror {
   remove(rel: string): Promise<void>;
 }
 
-/** Durable key/value for cursor and per-file revs (localStorage in the app). */
+/** Durable key/value for cursor and per-file revs (a persisted blob in the app). */
 export interface Store {
   get(key: string): string | null;
   set(key: string, value: string): void;
+  remove(key: string): void;
 }
 
 export interface SyncHooks {
@@ -31,10 +35,16 @@ export interface SyncHooks {
   onChanged(): void;
   /** Non-fatal problem worth surfacing (e.g. a toast). */
   onError(message: string): void;
+  /** Auth died (token revoked/expired); the loop has stopped and the user must
+   *  reconnect. Falls back to onError if not provided. */
+  onAuthExpired?(): void;
 }
 
 const CURSOR_KEY = "carnet.dropbox.cursor";
 const REV_PREFIX = "carnet.dropbox.rev.";
+
+/** How many files to download at once during a large sync. */
+const DOWNLOAD_CONCURRENCY = 6;
 
 /**
  * A {@link Store} held in memory and persisted as one JSON blob. Reads stay
@@ -79,6 +89,15 @@ export class CachedStore implements Store {
 
   set(key: string, value: string): void {
     this.data[key] = value;
+    this.schedule();
+  }
+
+  remove(key: string): void {
+    delete this.data[key];
+    this.schedule();
+  }
+
+  private schedule(): void {
     if (this.pending) return;
     this.pending = true;
     this.defer(() => {
@@ -108,12 +127,17 @@ class RevMap {
   set(rel: string, rev: string): void {
     this.store.set(REV_PREFIX + rel, rev);
   }
+  forget(rel: string): void {
+    this.store.remove(REV_PREFIX + rel);
+  }
 }
 
 export class DropboxSync {
   private revs: RevMap;
   private running = false;
   private stopped = false;
+  /** aborts the in-flight longpoll so stop() takes effect immediately */
+  private poll: AbortController | null = null;
 
   constructor(
     private client: DropboxClient,
@@ -136,7 +160,7 @@ export class DropboxSync {
   /** Pull the whole vault into the mirror once, establishing a cursor. Safe to
    *  call repeatedly; only downloads files whose rev we don't already have. */
   async initialSync(): Promise<void> {
-    let page: ListPage = await this.client.listFolder("");
+    let page: ListPage = await this.client.listFolder();
     await this.applyPage(page);
     while (page.hasMore) {
       page = await this.client.listFolderContinue(page.cursor);
@@ -147,14 +171,21 @@ export class DropboxSync {
   }
 
   private async applyPage(page: ListPage): Promise<void> {
-    for (const d of page.deltas) await this.applyDelta(d);
+    // Deletions are cheap and touch the store; do them inline. Downloads are
+    // the slow part, so run them with bounded concurrency.
+    const files: Delta[] = [];
+    for (const d of page.deltas) {
+      if (d.kind === "deleted") await this.applyDelta(d);
+      else files.push(d);
+    }
+    await mapPool(files, DOWNLOAD_CONCURRENCY, (d) => this.applyDelta(d));
   }
 
   private async applyDelta(d: Delta): Promise<void> {
     if (d.kind === "deleted") {
       if (this.revs.get(d.rel) !== undefined) {
         await this.mirror.remove(d.rel);
-        this.revs.set(d.rel, "");
+        this.revs.forget(d.rel);
       }
       return;
     }
@@ -180,7 +211,8 @@ export class DropboxSync {
           await this.initialSync();
           continue;
         }
-        const { changed, backoff } = await this.client.longpoll(cursor);
+        this.poll = new AbortController();
+        const { changed, backoff } = await this.client.longpoll(cursor, 480, this.poll.signal);
         if (this.stopped) break;
         if (backoff > 0) await this.sleep(backoff * 1000);
         if (changed) {
@@ -196,11 +228,24 @@ export class DropboxSync {
         failures = 0;
       } catch (e) {
         if (this.stopped) break;
+        // Dead auth: stop and hand off to the user, don't retry forever.
+        if (e instanceof DropboxAuthError) {
+          if (this.hooks.onAuthExpired) this.hooks.onAuthExpired();
+          else this.hooks.onError("Dropbox access expired — reconnect to keep syncing");
+          break;
+        }
+        // Invalidated cursor: drop it and re-list from scratch next iteration.
+        if (e instanceof CursorReset) {
+          this.store.remove(CURSOR_KEY);
+          failures = 0;
+          continue;
+        }
         failures++;
         this.hooks.onError("Dropbox sync: " + (e instanceof Error ? e.message : String(e)));
-        // exponential backoff, capped at ~1 min, so a network blip or a
-        // transient 5xx doesn't hammer the API.
-        await this.sleep(backoffMs(failures));
+        // Honor a server-requested Retry-After (429/503); otherwise exponential
+        // backoff capped at ~1 min so a blip doesn't hammer the API.
+        const wait = e instanceof DropboxError && e.retryAfterMs ? e.retryAfterMs : backoffMs(failures);
+        await this.sleep(wait);
       }
     }
     this.running = false;
@@ -208,11 +253,22 @@ export class DropboxSync {
 
   stop(): void {
     this.stopped = true;
+    this.poll?.abort();
+  }
+
+  /** The last-synced rev of a note, for the caller to snapshot before editing
+   *  so a racing pull can't silently move the upload's base out from under it. */
+  revOf(rel: string): string | undefined {
+    return this.revs.get(rel);
   }
 
   /**
-   * Push a locally-saved note to Dropbox. Returns the outcome so the caller can
-   * reuse Carnet's existing conflict UI:
+   * Push a locally-saved note to Dropbox. `baseRev` is the rev the edit was
+   * based on — pass the value snapshotted with {@link revOf} *before* the local
+   * write, NOT a value read at push time, so that a pull landing mid-save turns
+   * into a real conflict instead of a silent overwrite (undefined = a new file,
+   * uploaded unconditionally). Returns the outcome so the caller can reuse
+   * Carnet's existing conflict UI:
    *  - "ok": uploaded, rev recorded.
    *  - "conflict": the file moved on the server; `content` is the server copy
    *    now in the mirror, for the user to reconcile.
@@ -220,9 +276,9 @@ export class DropboxSync {
   async pushNote(
     rel: string,
     content: string,
+    baseRev: string | undefined,
   ): Promise<{ status: "ok" } | { status: "conflict"; content: string }> {
     if (!isMarkdown(rel)) throw new Error("only .md notes sync to Dropbox");
-    const baseRev = this.revs.get(rel);
     try {
       const { rev } = await this.client.upload(rel, content, baseRev || undefined);
       this.revs.set(rel, rev);
@@ -243,6 +299,18 @@ export class DropboxSync {
 
 export function backoffMs(failures: number): number {
   return Math.min(60_000, 1000 * 2 ** (failures - 1));
+}
+
+/** Run `fn` over `items` with at most `n` in flight. Rejects if any does. */
+async function mapPool<T>(items: T[], n: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let i = 0;
+  const worker = async (): Promise<void> => {
+    while (i < items.length) {
+      const item = items[i++]!;
+      await fn(item);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
 }
 
 function defaultSleep(ms: number): Promise<void> {

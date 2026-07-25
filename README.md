@@ -102,11 +102,25 @@ pushing your own saves straight back. Desktop is unaffected and still uses a pla
 Dropbox client there is already near-instant).
 
 To use it you supply your own Dropbox **app key** (one-time, so the app isn't tied to a shared
-key): create a [Scoped app](https://www.dropbox.com/developers/apps) with the
-`files.content.read` and `files.content.write` scopes, paste the key into the setup screen, and
-authorize. Auth is OAuth2 with PKCE and no redirect — Dropbox shows a code you paste back — so
-there's no server and no secret. The refresh token is stored on-device; only `.md` notes sync
-(attachments still ride whatever folder sync you have).
+key):
+
+1. Create a [Scoped app](https://www.dropbox.com/developers/apps) with **App folder** access
+   (recommended). The app is then confined to its own `/Apps/<your app>/` folder and can never
+   see the rest of your Dropbox — least privilege, so a leaked token can't reach anything else.
+   Your notes live in that folder. Choose **Full Dropbox** instead only if you need to sync an
+   existing folder elsewhere in your account in place.
+2. On the app's **Permissions** tab, tick `files.metadata.read`, `files.content.read` and
+   `files.content.write`. All three are required — `list_folder` and the long-poll need the
+   metadata scope, download needs content read, upload/delete need content write.
+3. Paste the app key into the setup screen. Optionally set a **subfolder to sync** (e.g.
+   `/notes`, relative to the app folder; leave blank to sync the whole app folder). Then
+   authorize.
+
+Because paths are relative to the app's root, App folder and Full Dropbox use the exact same
+code — the choice is purely how much of your Dropbox the token can reach. Auth is OAuth2 with
+PKCE and no redirect — Dropbox shows a code you paste back — so there's no server and no secret.
+Only `.md` notes under the chosen folder sync (attachments still ride whatever folder sync you
+have).
 
 Authorizing sends you to the browser, and Android may kill Carnet while it's in the
 background, so the app comes back to a freshly loaded page. Anything that has to outlive that

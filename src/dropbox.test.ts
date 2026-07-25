@@ -1,11 +1,15 @@
 import { expect, test, describe } from "bun:test";
 import {
+  CursorReset,
+  DropboxAuthError,
   DropboxClient,
+  DropboxError,
   WriteConflict,
   authorizeUrl,
   challengeFor,
   exchangeCode,
   isMarkdown,
+  normalizeFolder,
   randomVerifier,
   toDropbox,
   toRel,
@@ -51,6 +55,9 @@ class MemStore implements Store {
   }
   set(k: string, v: string): void {
     this.map.set(k, v);
+  }
+  remove(k: string): void {
+    this.map.delete(k);
   }
 }
 
@@ -118,6 +125,19 @@ describe("path mapping", () => {
     expect(isMarkdown("a.md")).toBe(true);
     expect(isMarkdown("a.txt")).toBe(false);
   });
+  test("a base folder is stripped and re-applied, case-insensitively", () => {
+    expect(toRel("/notes/a/b.md", "/notes")).toBe("a/b.md");
+    expect(toDropbox("a/b.md", "/notes")).toBe("/notes/a/b.md");
+    expect(toRel("/Notes/a.md", "/notes")).toBe("a.md"); // display case may differ
+    expect(toRel(toDropbox("x.md", "/notes"), "/notes")).toBe("x.md");
+  });
+  test("normalizeFolder yields '' or a leading-slash, no-trailing-slash path", () => {
+    expect(normalizeFolder("")).toBe("");
+    expect(normalizeFolder("/")).toBe("");
+    expect(normalizeFolder("notes")).toBe("/notes");
+    expect(normalizeFolder("/notes/")).toBe("/notes");
+    expect(normalizeFolder("  /a/b/  ")).toBe("/a/b");
+  });
 });
 
 /* ---------------- client behaviour ---------------- */
@@ -130,8 +150,8 @@ describe("DropboxClient", () => {
       return json({ entries: [], cursor: "cur", has_more: false });
     });
     const expired: Tokens = { accessToken: "old", refreshToken: "rt", expiresAt: 0 };
-    const c = new DropboxClient(expired, "APPKEY", fetch, () => clock);
-    await c.listFolder("");
+    const c = new DropboxClient(expired, "APPKEY", "", fetch, () => clock);
+    await c.listFolder();
     expect(calls[0]!.url).toContain("/oauth2/token");
     // the RPC used the refreshed bearer token
     const auth = (calls[1]!.init!.headers as Record<string, string>).authorization;
@@ -152,8 +172,8 @@ describe("DropboxClient", () => {
         has_more: false,
       }),
     );
-    const c = new DropboxClient(tokens(), "APPKEY", fetch);
-    const page = await c.listFolder("");
+    const c = new DropboxClient(tokens(), "APPKEY", "", fetch);
+    const page = await c.listFolder();
     expect(page.deltas).toEqual([
       { kind: "file", rel: "a.md", rev: "r1" },
       { kind: "deleted", rel: "old.md" },
@@ -168,7 +188,7 @@ describe("DropboxClient", () => {
           headers: { "Dropbox-API-Result": JSON.stringify({ rev: "r9" }) },
         }),
     );
-    const c = new DropboxClient(tokens(), "APPKEY", fetch);
+    const c = new DropboxClient(tokens(), "APPKEY", "", fetch);
     expect(await c.download("a.md")).toEqual({ content: "hello", rev: "r9" });
   });
 
@@ -176,13 +196,13 @@ describe("DropboxClient", () => {
     const { fetch } = fakeFetch(
       () => new Response('{"error_summary":"path/conflict/..."}', { status: 409 }),
     );
-    const c = new DropboxClient(tokens(), "APPKEY", fetch);
+    const c = new DropboxClient(tokens(), "APPKEY", "", fetch);
     await expect(c.upload("a.md", "x", "baseRev")).rejects.toBeInstanceOf(WriteConflict);
   });
 
   test("upload sends update mode with the base rev when given", async () => {
     const { fetch, calls } = fakeFetch(() => json({ rev: "r2" }));
-    const c = new DropboxClient(tokens(), "APPKEY", fetch);
+    const c = new DropboxClient(tokens(), "APPKEY", "", fetch);
     const out = await c.upload("a.md", "x", "r1");
     expect(out).toEqual({ rev: "r2" });
     const arg = JSON.parse((calls[0]!.init!.headers as Record<string, string>)["Dropbox-API-Arg"]!);
@@ -191,11 +211,70 @@ describe("DropboxClient", () => {
 
   test("longpoll uses the notify host with no auth header", async () => {
     const { fetch, calls } = fakeFetch(() => json({ changes: true }));
-    const c = new DropboxClient(tokens(), "APPKEY", fetch);
+    const c = new DropboxClient(tokens(), "APPKEY", "", fetch);
     const r = await c.longpoll("cur");
     expect(r).toEqual({ changed: true, backoff: 0 });
     expect(calls[0]!.url).toContain("notify.dropboxapi.com");
     expect((calls[0]!.init!.headers as Record<string, string>).authorization).toBeUndefined();
+  });
+
+  test("a client scoped to a folder lists and maps paths under it", async () => {
+    const { fetch, calls } = fakeFetch((url) => {
+      if (url.endsWith("/list_folder")) return json({ entries: [], cursor: "c", has_more: false });
+      return json({ rev: "r" });
+    });
+    const c = new DropboxClient(tokens(), "APPKEY", "/notes", fetch);
+    await c.listFolder();
+    expect(JSON.parse(calls[0]!.init!.body as string).path).toBe("/notes");
+    await c.upload("a.md", "x", undefined);
+    const arg = JSON.parse((calls[1]!.init!.headers as Record<string, string>)["Dropbox-API-Arg"]!);
+    expect(arg.path).toBe("/notes/a.md");
+  });
+
+  test("a 429 surfaces the server's Retry-After on the error", async () => {
+    const { fetch } = fakeFetch(
+      () => new Response("rate limited", { status: 429, headers: { "retry-after": "7" } }),
+    );
+    const c = new DropboxClient(tokens(), "APPKEY", "", fetch);
+    const err = await c.listFolder().then(
+      () => null,
+      (e) => e,
+    );
+    expect(err).toBeInstanceOf(DropboxError);
+    expect((err as DropboxError).retryAfterMs).toBe(7000);
+  });
+
+  test("a 401 is classified as an auth error", async () => {
+    const { fetch } = fakeFetch(() => new Response("bad token", { status: 401 }));
+    const c = new DropboxClient(tokens(), "APPKEY", "", fetch);
+    const err = await c.download("a.md").then(
+      () => null,
+      (e) => e,
+    );
+    expect(err).toBeInstanceOf(DropboxAuthError);
+  });
+
+  test("a dead refresh token (400 invalid_grant) is an auth error", async () => {
+    const { fetch } = fakeFetch(() => new Response('{"error":"invalid_grant"}', { status: 400 }));
+    const expired: Tokens = { accessToken: "x", refreshToken: "rt", expiresAt: 0 };
+    const c = new DropboxClient(expired, "APPKEY", "", fetch);
+    const err = await c.listFolder().then(
+      () => null,
+      (e) => e,
+    );
+    expect(err).toBeInstanceOf(DropboxAuthError);
+  });
+
+  test("an invalidated cursor is classified as a reset", async () => {
+    const { fetch } = fakeFetch(
+      () => new Response('{"error_summary":"reset/...","error":{".tag":"reset"}}', { status: 409 }),
+    );
+    const c = new DropboxClient(tokens(), "APPKEY", "", fetch);
+    const err = await c.listFolderContinue("stale").then(
+      () => null,
+      (e) => e,
+    );
+    expect(err).toBeInstanceOf(CursorReset);
   });
 });
 
@@ -204,7 +283,7 @@ describe("DropboxClient", () => {
 describe("DropboxSync", () => {
   function harness(handler: (url: string, init?: RequestInit) => Response) {
     const { fetch, calls } = fakeFetch(handler);
-    const client = new DropboxClient(tokens(), "APPKEY", fetch);
+    const client = new DropboxClient(tokens(), "APPKEY", "", fetch);
     const mirror = new MemMirror();
     const store = new MemStore();
     const errors: string[] = [];
@@ -277,7 +356,7 @@ describe("DropboxSync", () => {
         });
       return json({});
     });
-    const client = new DropboxClient(tokens(), "APPKEY", fetch);
+    const client = new DropboxClient(tokens(), "APPKEY", "", fetch);
     const mirror = new MemMirror();
     mirror.files.set("a.md", "old");
     const store = new MemStore();
@@ -293,11 +372,13 @@ describe("DropboxSync", () => {
     await sync.run();
     expect(mirror.files.has("a.md")).toBe(false);
     expect(store.get("carnet.dropbox.cursor")).toBe("C2");
+    // the dead rev key is removed, not left as an empty string
+    expect(store.get("carnet.dropbox.rev.a.md")).toBeNull();
   });
 
   test("pushNote records the returned rev on success", async () => {
     const h = harness(() => json({ rev: "rNEW" }));
-    const out = await h.sync.pushNote("a.md", "content");
+    const out = await h.sync.pushNote("a.md", "content", undefined);
     expect(out).toEqual({ status: "ok" });
     expect(h.store.get("carnet.dropbox.rev.a.md")).toBe("rNEW");
   });
@@ -313,10 +394,107 @@ describe("DropboxSync", () => {
       return json({});
     });
     h.store.set("carnet.dropbox.rev.a.md", "rOld");
-    const out = await h.sync.pushNote("a.md", "mine");
+    const out = await h.sync.pushNote("a.md", "mine", "rOld");
     expect(out).toEqual({ status: "conflict", content: "server-wins" });
     expect(h.mirror.files.get("a.md")).toBe("server-wins");
     expect(h.store.get("carnet.dropbox.rev.a.md")).toBe("rServer");
+  });
+
+  test("pushNote uploads against the snapshotted base rev, not the stored one", async () => {
+    const seen: string[] = [];
+    const h = harness((url, init) => {
+      if (url.endsWith("/upload")) {
+        const arg = JSON.parse((init!.headers as Record<string, string>)["Dropbox-API-Arg"]!);
+        seen.push(arg.mode.update);
+        return json({ rev: "rNEW" });
+      }
+      return json({});
+    });
+    // The store rev has moved (a pull landed) but the edit was based on rOld.
+    h.store.set("carnet.dropbox.rev.a.md", "rMoved");
+    await h.sync.pushNote("a.md", "mine", "rOld");
+    expect(seen).toEqual(["rOld"]); // conditioned on the caller's snapshot
+  });
+
+  test("revOf returns the last-synced rev", () => {
+    const h = harness(() => json({}));
+    h.store.set("carnet.dropbox.rev.a.md", "r7");
+    expect(h.sync.revOf("a.md")).toBe("r7");
+    expect(h.sync.revOf("missing.md")).toBeUndefined();
+  });
+
+  test("an invalidated cursor is dropped and the loop re-lists from scratch", async () => {
+    const { fetch } = fakeFetch((url) => {
+      if (url.endsWith("/list_folder/longpoll")) return json({ changes: true });
+      if (url.endsWith("/list_folder/continue"))
+        return new Response('{"error":{".tag":"reset"}}', { status: 409 });
+      if (url.endsWith("/list_folder"))
+        return json({
+          entries: [{ ".tag": "file", path_display: "/a.md", rev: "r1" }],
+          cursor: "C2",
+          has_more: false,
+        });
+      return new Response("body", {
+        status: 200,
+        headers: { "Dropbox-API-Result": JSON.stringify({ rev: "r1" }) },
+      });
+    });
+    const mirror = new MemMirror();
+    const store = new MemStore();
+    store.set("carnet.dropbox.cursor", "C1"); // stale cursor
+    const sync = new DropboxSync(
+      new DropboxClient(tokens(), "APPKEY", "", fetch),
+      mirror,
+      store,
+      { onChanged: () => sync.stop(), onError: () => {} }, // stop after the re-list
+      noSleep,
+    );
+    await sync.run();
+    expect(mirror.files.get("a.md")).toBe("body");
+    expect(store.get("carnet.dropbox.cursor")).toBe("C2");
+  });
+
+  test("dead auth stops the loop and calls onAuthExpired", async () => {
+    let authExpired = 0;
+    const { fetch } = fakeFetch((url) => {
+      if (url.endsWith("/list_folder/longpoll")) return json({ changes: true });
+      if (url.endsWith("/list_folder/continue")) return new Response("nope", { status: 401 });
+      return json({});
+    });
+    const store = new MemStore();
+    store.set("carnet.dropbox.cursor", "C1");
+    const sync = new DropboxSync(
+      new DropboxClient(tokens(), "APPKEY", "", fetch),
+      new MemMirror(),
+      store,
+      { onChanged: () => {}, onError: () => {}, onAuthExpired: () => authExpired++ },
+      noSleep,
+    );
+    await sync.run(); // resolves because the loop breaks on auth failure
+    expect(authExpired).toBe(1);
+  });
+
+  test("the loop waits the server's Retry-After after a 429", async () => {
+    const slept: number[] = [];
+    const { fetch } = fakeFetch((url) => {
+      if (url.endsWith("/list_folder/longpoll"))
+        return new Response("slow down", { status: 429, headers: { "retry-after": "5" } });
+      return json({});
+    });
+    const store = new MemStore();
+    store.set("carnet.dropbox.cursor", "C1");
+    const sync = new DropboxSync(
+      new DropboxClient(tokens(), "APPKEY", "", fetch),
+      new MemMirror(),
+      store,
+      { onChanged: () => {}, onError: () => sync.stop() }, // stop after the first failure
+      (ms) => {
+        slept.push(ms);
+        return Promise.resolve();
+      },
+    );
+    await sync.run();
+    expect(slept).toContain(5000); // honored Retry-After, not the 1s default backoff
   });
 });
 
@@ -397,7 +575,7 @@ describe("CachedStore", () => {
       return json({});
     });
     const sync = new DropboxSync(
-      new DropboxClient(tokens(), "APPKEY", fetch),
+      new DropboxClient(tokens(), "APPKEY", "", fetch),
       new MemMirror(),
       h.store,
       { onChanged: () => {}, onError: () => {} },
