@@ -112,9 +112,14 @@ Authorizing sends you to the browser, and Android may kill Carnet while it's in 
 background, so the app comes back to a freshly loaded page. Anything that has to outlive that
 — the notes folder, the app key, the half-finished PKCE handshake, the sync cursor — is
 written to a file in the app's own data directory rather than to the webview's `localStorage`,
-which the system is free to discard. (If the setup screen ever tells you to authorize first,
-that's what it means: press **Authorize Dropbox…** again and use the new code — a code only
-works with the handshake that produced it.)
+which the system is free to discard.
+
+The pasted code is the fragile step, so: pressing **Authorize Dropbox…** again keeps the
+previous handshakes alive (a code copied from an older browser tab is still accepted), the
+code box is cleared when a new authorization starts, and the finish button is held while the
+exchange is in flight — a second tap would re-send a single-use code and fail a connection
+that was working. If Dropbox still rejects the code, it has expired or been used: authorize
+again and paste the new one promptly.
 
 Under the hood this is
 [`src/client/dropbox.ts`](src/client/dropbox.ts) (API client) and
