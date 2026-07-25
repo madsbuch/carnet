@@ -14,21 +14,49 @@ export type SaveResult =
   | { status: "ok"; mtime: number }
   | { status: "conflict"; content: string; mtime: number };
 
+/* ---------- durable state ----------
+ * Anything that has to survive a restart lives in a file in the app's data
+ * dir, not in localStorage: Android drops the webview's web storage when the
+ * app is killed in the background, so localStorage is a cache at best. */
+
+/** Read a state blob; null if it was never written. */
+export const readState = (name: string) => invoke<string | null>("read_state", { name });
+
+/** Write a state blob, or delete it with `content: null`. */
+export const writeState = (name: string, content: string | null) =>
+  invoke<void>("write_state", { name, content });
+
 const VAULT_KEY = "carnet.vault";
+const VAULT_FILE = "vault.txt";
+// localStorage seeds the value synchronously so nothing has to wait for IPC;
+// loadVault() then corrects it from the file that actually persists.
 let root: string | null = localStorage.getItem(VAULT_KEY);
 
 export function vaultRoot(): string | null {
   return root;
 }
 
+/** Boot step: adopt the persisted vault (or migrate the localStorage one). */
+export async function loadVault(): Promise<void> {
+  const stored = (await readState(VAULT_FILE).catch(() => null))?.trim();
+  if (stored) {
+    root = stored;
+    localStorage.setItem(VAULT_KEY, stored);
+  } else if (root) {
+    await writeState(VAULT_FILE, root).catch(() => {});
+  }
+}
+
 export function setVault(path: string): void {
   root = path;
   localStorage.setItem(VAULT_KEY, path);
+  void writeState(VAULT_FILE, path).catch(() => {});
 }
 
 export function clearVault(): void {
   root = null;
   localStorage.removeItem(VAULT_KEY);
+  void writeState(VAULT_FILE, null).catch(() => {});
 }
 
 export function vaultValid(path: string): Promise<boolean> {

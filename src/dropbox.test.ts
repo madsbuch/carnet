@@ -12,7 +12,13 @@ import {
   type FetchLike,
   type Tokens,
 } from "./client/dropbox";
-import { DropboxSync, backoffMs, type Mirror, type Store } from "./client/dropboxsync";
+import {
+  CachedStore,
+  DropboxSync,
+  backoffMs,
+  type Mirror,
+  type Store,
+} from "./client/dropboxsync";
 
 /* ---------------- test doubles ---------------- */
 
@@ -311,6 +317,99 @@ describe("DropboxSync", () => {
     expect(out).toEqual({ status: "conflict", content: "server-wins" });
     expect(h.mirror.files.get("a.md")).toBe("server-wins");
     expect(h.store.get("carnet.dropbox.rev.a.md")).toBe("rServer");
+  });
+});
+
+describe("CachedStore", () => {
+  /** A blob "file" plus a defer that runs the flush on demand. */
+  function harness(initial: string | null = null) {
+    let blob = initial;
+    const writes: (string | null)[] = [];
+    let deferred: (() => void) | null = null;
+    const store = new CachedStore(
+      () => Promise.resolve(blob),
+      (b) => {
+        blob = b;
+        writes.push(b);
+        return Promise.resolve();
+      },
+      (fn) => {
+        deferred = fn;
+      },
+    );
+    return { store, writes, blob: () => blob, tick: () => deferred?.() };
+  }
+
+  test("survives a restart: what was set comes back", async () => {
+    const a = harness();
+    a.store.set("carnet.dropbox.cursor", "CUR");
+    a.tick();
+    const b = harness(a.blob());
+    await b.store.load();
+    expect(b.store.get("carnet.dropbox.cursor")).toBe("CUR");
+    expect(b.store.get("nope")).toBeNull();
+  });
+
+  test("coalesces a burst of sets into one write", async () => {
+    const h = harness();
+    for (let i = 0; i < 50; i++) h.store.set("k" + i, String(i));
+    expect(h.writes).toHaveLength(0); // nothing until the deferred flush runs
+    h.tick();
+    await Promise.resolve();
+    expect(h.writes).toHaveLength(1);
+    expect(JSON.parse(h.blob() ?? "{}")).toMatchObject({ k0: "0", k49: "49" });
+    h.store.set("later", "1"); // a new burst schedules again
+    h.tick();
+    await Promise.resolve();
+    expect(h.writes).toHaveLength(2);
+  });
+
+  test("a corrupt or unreadable blob starts empty instead of throwing", async () => {
+    const h = harness("{not json");
+    await h.store.load();
+    expect(h.store.get("carnet.dropbox.cursor")).toBeNull();
+
+    const failing = new CachedStore(
+      () => Promise.reject(new Error("no such file")),
+      () => Promise.resolve(),
+    );
+    await failing.load();
+    expect(failing.get("carnet.dropbox.cursor")).toBeNull();
+  });
+
+  test("clear drops the blob so a reconnect starts clean", async () => {
+    const h = harness();
+    h.store.set("carnet.dropbox.rev.a.md", "r1");
+    h.tick();
+    await h.store.clear();
+    expect(h.blob()).toBeNull();
+    expect(h.store.get("carnet.dropbox.rev.a.md")).toBeNull();
+  });
+
+  test("drives the engine: a second run resumes from the persisted cursor", async () => {
+    const h = harness();
+    let listCalls = 0;
+    const { fetch } = fakeFetch((url) => {
+      if (url.endsWith("/list_folder")) {
+        listCalls++;
+        return json({ entries: [], cursor: "C1", has_more: false });
+      }
+      return json({});
+    });
+    const sync = new DropboxSync(
+      new DropboxClient(tokens(), "APPKEY", fetch),
+      new MemMirror(),
+      h.store,
+      { onChanged: () => {}, onError: () => {} },
+      noSleep,
+    );
+    await sync.initialSync();
+    h.tick();
+    expect(listCalls).toBe(1);
+
+    const restarted = harness(h.blob());
+    await restarted.store.load();
+    expect(restarted.store.get("carnet.dropbox.cursor")).toBe("C1");
   });
 });
 
