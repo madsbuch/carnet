@@ -44,11 +44,17 @@
 <main id="main">
   <article id="preview" class="markdown"></article>
   <textarea id="editor" hidden spellcheck="false" autocapitalize="sentences"></textarea>
+  <div id="notecount" hidden></div>
   <section id="backlinks" hidden>
     <h4>Linked from</h4>
     <ul></ul>
   </section>
 </main>
+
+<!-- Whole-note thumbnail + viewport box, on wide windows only (see style.css).
+     The canvas is wrapped because a replaced element won't stretch between
+     top and bottom on its own — the wrapper is the one with the geometry. -->
+<div id="minimap"><canvas></canvas></div>
 
 <div id="quickopen" hidden>
   <div id="qo-panel">

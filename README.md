@@ -18,13 +18,21 @@ directly. There is no server and no database; Dropbox does all the syncing.
 - **TODOs** — `- [ ]` checkboxes are clickable in the rendered view and write straight back
   to the file.
 - **Backlinks** — every note lists the notes that link to it.
+- **Counts** — a faint `words · chars` line under the note, and the same under the block
+  you're editing, live as you type. Markdown's own dressing (`#`, `- [x]`, fences, `---`)
+  never counts as a word; CJK counts per character.
+- **Minimap** — the whole note drawn down the right edge, with the viewport as a box you can
+  click or drag, like VS Code's. It lives in the gutter beside the text column, so it appears
+  only on windows wide enough to have one — never on a phone, and never in source mode.
 - **Quick open** — `⌘K` (or `/`): fuzzy filename matching plus full-text search; type a new
   name to create a note.
 - **Sync-aware** — notes re-read when the app regains focus; if a save collides with an edit
   synced from another device you choose which version wins.
 
 The interface is one page: the note, four buttons, a file tree behind the hamburger. Purpose
-lives in file names (`projects/carnet/carnet-tasks.md`), not in menus. On phone-sized
+lives in file names (`projects/carnet/carnet-tasks.md`), not in menus. A note scrolls half a
+screen past its end, so writing at the end of a long one doesn't mean writing at the bottom
+edge of the screen (or behind the keyboard). On phone-sized
 screens the hamburger opens a full-screen files view instead — search on top, the tree
 below — since a drawer is cramped there.
 
@@ -174,7 +182,8 @@ They're also on each run's **Artifacts** if you need a specific commit's build.
 ```
 src/links.ts        [wiki-link] parsing + resolution, task toggling (shared, pure)
 src/graph-data.ts   link graph, search, daily-note logic (shared, pure)
-src/client/         the UI: app.ts, graph.ts (canvas), wiki.ts (marked extension)
+src/counts.ts       word / character counting (shared, pure)
+src/client/         the UI: app.ts, graph.ts + minimap.ts (canvas), wiki.ts (marked extension)
 src/dev.ts          dev-only hot-reload server for `tauri dev`
 src-tauri/          Rust: filesystem commands (list/read/write, conflict detection)
 icon/               app icon sources; regenerate with `python3 icon/generate.py`
