@@ -38,6 +38,9 @@ export interface Store {
 export interface SyncHooks {
   /** Called after a batch of remote changes lands in the mirror. */
   onChanged(): void;
+  /** Notes fetched so far. A first sync of a large vault takes minutes, and
+   *  without this the app has nothing to say for the whole of it. */
+  onProgress?(fetched: number): void;
   /** Non-fatal problem worth surfacing (e.g. a toast). */
   onError(message: string): void;
   /** Auth died (token revoked/expired); the loop has stopped and the user must
@@ -147,6 +150,12 @@ class RevMap {
 
 export class DropboxSync {
   private revs: RevMap;
+  /** Server rev fetched while reporting a conflict, so the user's "keep mine"
+   *  uploads against it instead of colliding again. In memory only: an
+   *  unresolved conflict is re-detected from scratch next time. */
+  private serverRevs = new Map<string, string>();
+  /** Notes downloaded this session, for progress reporting. */
+  private fetched = 0;
   private running = false;
   private stopped = false;
   /** aborts the in-flight longpoll so stop() takes effect immediately */
@@ -195,6 +204,16 @@ export class DropboxSync {
   }
 
   private async applyDelta(d: Delta): Promise<void> {
+    // A pull must never touch a note whose own edit hasn't been delivered yet —
+    // that local text is the only copy of it. This has to come before the
+    // deletion branch as well as the download: a note deleted or renamed on
+    // another device arrives here as a delete, and removing the mirror file
+    // would take the un-uploaded edit with it. Leaving the rev unrecorded means
+    // the delta is applied later, once the edit is out.
+    if (this.store.get(OUTBOX_PREFIX + d.rel) !== null) {
+      this.hooks.onError(`${d.rel} changed in Dropbox but has unsent local edits`);
+      return;
+    }
     if (d.kind === "deleted") {
       if (this.revs.get(d.rel) !== undefined) {
         await this.mirror.remove(d.rel);
@@ -205,17 +224,16 @@ export class DropboxSync {
     // A file we already have at this exact rev needs no download — this makes
     // the loop idempotent and ignores the echo of our own uploads.
     if (this.revs.get(d.rel) === d.rev) return;
-    // Never let a pull overwrite an edit that hasn't been uploaded yet: that
-    // local text is the only copy of it. Leaving the rev unrecorded means the
-    // download is retried once the edit is delivered, and drainOutbox will
-    // report the collision in the meantime.
-    if (this.store.get(OUTBOX_PREFIX + d.rel) !== null) {
-      this.hooks.onError(`${d.rel} changed in Dropbox but has unsent local edits`);
-      return;
-    }
     const { content, rev } = await this.client.download(d.rel);
     await this.mirror.write(d.rel, content);
     this.revs.set(d.rel, rev);
+    this.fetched++;
+    this.hooks.onProgress?.(this.fetched);
+  }
+
+  /** How many notes this session has pulled down. */
+  fetchedCount(): number {
+    return this.fetched;
   }
 
   /** Longpoll loop: block until Dropbox reports a change, drain the deltas into
@@ -314,15 +332,43 @@ export class DropboxSync {
       return { status: "ok" };
     } catch (e) {
       if (e instanceof WriteConflict) {
+        // Fetch the server's version but leave the mirror alone: the local file
+        // still holds the user's text, and this function has no idea which of
+        // the two they want. Writing the server copy here destroyed their edit
+        // before the dialog had even opened — and if the app died with the
+        // dialog up, it was gone. The entry stays owed for the same reason;
+        // resolveConflict() clears it once a choice has actually been made.
         const server = await this.client.download(rel);
-        await this.mirror.write(rel, server.content);
-        this.revs.set(rel, server.rev);
-        // The caller resolves this one interactively; it is no longer owed.
-        this.store.remove(OUTBOX_PREFIX + rel);
+        this.serverRevs.set(rel, server.rev);
         return { status: "conflict", content: server.content };
       }
       throw e;
     }
+  }
+
+  /**
+   * Commit the user's answer to a conflict {@link pushNote} reported.
+   *
+   * "mine" re-uploads against the rev that was just fetched, so it wins rather
+   * than colliding again. "theirs" is the only path that overwrites the mirror,
+   * and it happens only because the user asked for it.
+   */
+  async resolveConflict(
+    rel: string,
+    choice: "mine" | "theirs",
+    content: string,
+  ): Promise<{ status: "ok" } | { status: "conflict"; content: string }> {
+    const serverRev = this.serverRevs.get(rel);
+    if (choice === "theirs") {
+      await this.mirror.write(rel, content);
+      if (serverRev !== undefined) this.revs.set(rel, serverRev);
+      this.serverRevs.delete(rel);
+      this.store.remove(OUTBOX_PREFIX + rel);
+      return { status: "ok" };
+    }
+    const out = await this.pushNote(rel, content, serverRev);
+    if (out.status === "ok") this.serverRevs.delete(rel);
+    return out;
   }
 
   /** Paths whose upload never landed. */

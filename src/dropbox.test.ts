@@ -574,6 +574,33 @@ describe("DropboxSync", () => {
     expect(h.sync.isSynced()).toBe(false);
   });
 
+  test("progress is reported per note, so a long first sync isn't silent", async () => {
+    const { fetch } = fakeFetch((url) => {
+      if (url.endsWith("/list_folder"))
+        return json({
+          entries: [
+            { ".tag": "file", path_display: "/a.md", rev: "r1" },
+            { ".tag": "file", path_display: "/b.md", rev: "r2" },
+            { ".tag": "file", path_display: "/c.md", rev: "r3" },
+          ],
+          cursor: "C1",
+          has_more: false,
+        });
+      return new Response("body", { status: 200, headers: { "Dropbox-API-Result": '{"rev":"r"}' } });
+    });
+    const progress: number[] = [];
+    const sync = new DropboxSync(
+      new DropboxClient(tokens(), "APPKEY", "", fetch),
+      new MemMirror(),
+      new MemStore(),
+      { onChanged: () => {}, onError: () => {}, onProgress: (n) => progress.push(n) },
+      noSleep,
+    );
+    await sync.initialSync();
+    expect(progress).toEqual([1, 2, 3]);
+    expect(sync.fetchedCount()).toBe(3);
+  });
+
   test("isSynced only becomes true once a full listing has landed", async () => {
     const h = harness((url) => {
       if (url.endsWith("/list_folder"))
@@ -596,9 +623,14 @@ describe("DropboxSync", () => {
     expect(h.store.get("carnet.dropbox.rev.a.md")).toBe("rNEW");
   });
 
-  test("pushNote surfaces a conflict and pulls the server copy into the mirror", async () => {
-    const h = harness((url) => {
-      if (url.endsWith("/upload")) return new Response('{"error_summary":"path/conflict"}', { status: 409 });
+  /** Conflicts on upload, and serves "server-wins" at rev rServer. */
+  function conflicting(onUpload?: (body: string) => Response) {
+    return harness((url, init) => {
+      if (url.endsWith("/upload")) {
+        const r = onUpload?.(init!.body as string);
+        if (r) return r;
+        return new Response('{"error_summary":"path/conflict"}', { status: 409 });
+      }
       if (url.endsWith("/download"))
         return new Response("server-wins", {
           status: 200,
@@ -606,11 +638,79 @@ describe("DropboxSync", () => {
         });
       return json({});
     });
+  }
+
+  test("a conflict reports the server copy but leaves the local file alone", async () => {
+    const h = conflicting();
+    await h.mirror.write("a.md", "mine");
     h.store.set("carnet.dropbox.rev.a.md", "rOld");
+
     const out = await h.sync.pushNote("a.md", "mine", "rOld");
     expect(out).toEqual({ status: "conflict", content: "server-wins" });
-    expect(h.mirror.files.get("a.md")).toBe("server-wins");
-    expect(h.store.get("carnet.dropbox.rev.a.md")).toBe("rServer");
+    // the user hasn't been asked yet — their text must still be the local copy
+    expect(await h.mirror.read("a.md")).toBe("mine");
+    // and it stays owed, so dying with the dialog open doesn't lose it
+    expect(h.sync.pendingUploads()).toBe(1);
+  });
+
+  test("resolving 'keep mine' re-uploads against the rev that was just fetched", async () => {
+    const bases: (string | undefined)[] = [];
+    let first = true;
+    const h = conflicting((body) => {
+      if (first) {
+        first = false;
+        return undefined as unknown as Response; // let it 409 once
+      }
+      return json({ rev: "rMine", _body: body } as never);
+    });
+    await h.mirror.write("a.md", "mine");
+    h.store.set("carnet.dropbox.rev.a.md", "rOld");
+    await h.sync.pushNote("a.md", "mine", "rOld");
+
+    // record what the winning upload was conditioned on
+    const spy = h.calls.filter((c) => c.url.endsWith("/upload"));
+    const out = await h.sync.resolveConflict("a.md", "mine", "mine");
+    for (const c of h.calls.filter((x) => x.url.endsWith("/upload")).slice(spy.length)) {
+      bases.push(JSON.parse((c.init!.headers as Record<string, string>)["Dropbox-API-Arg"]!).mode.update);
+    }
+    expect(out.status).toBe("ok");
+    expect(bases).toEqual(["rServer"]); // not rOld, which would collide again
+    expect(await h.mirror.read("a.md")).toBe("mine");
+    expect(h.sync.pendingUploads()).toBe(0);
+  });
+
+  test("resolving 'take theirs' is the only thing that overwrites the local file", async () => {
+    const h = conflicting();
+    await h.mirror.write("a.md", "mine");
+    h.store.set("carnet.dropbox.rev.a.md", "rOld");
+    const out = await h.sync.pushNote("a.md", "mine", "rOld");
+    expect(await h.mirror.read("a.md")).toBe("mine");
+
+    await h.sync.resolveConflict("a.md", "theirs", (out as { content: string }).content);
+    expect(await h.mirror.read("a.md")).toBe("server-wins");
+    expect(h.sync.revOf("a.md")).toBe("rServer");
+    expect(h.sync.pendingUploads()).toBe(0);
+  });
+
+  test("a note deleted on another device is not removed while its edit is owed", async () => {
+    const h = harness((url) => {
+      if (url.endsWith("/upload")) throw new Error("network down");
+      if (url.endsWith("/list_folder"))
+        return json({
+          entries: [{ ".tag": "deleted", path_display: "/ideas.md" }],
+          cursor: "C1",
+          has_more: false,
+        });
+      return json({});
+    });
+    await h.mirror.write("ideas.md", "a page written on a train");
+    h.store.set("carnet.dropbox.rev.ideas.md", "r1");
+    await expect(h.sync.pushNote("ideas.md", "a page written on a train", "r1")).rejects.toThrow();
+
+    await h.sync.initialSync(); // the delete arrives before the edit got out
+
+    expect(await h.mirror.read("ideas.md")).toBe("a page written on a train");
+    expect(h.sync.pendingUploads()).toBe(1);
   });
 
   test("pushNote uploads against the snapshotted base rev, not the stored one", async () => {

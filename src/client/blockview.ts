@@ -58,6 +58,10 @@ interface ActiveEdit {
   textarea: HTMLTextAreaElement;
   /** Appending after the current end of the note (no lines replaced yet). */
   append?: boolean;
+  /** This session started as an append and has since written its lines. Emptying
+   *  it again has to take those lines back out, rather than splice a blank in
+   *  where the user never wrote one. */
+  wasAppend?: boolean;
 }
 
 interface RenderGroup {
@@ -159,6 +163,12 @@ export class BlockView {
     this.active = null;
     this.staleDom = false;
     this.staleShifted = false;
+    // These measure the drift between the content and the DOM. A fresh render
+    // *is* the content, so any earlier drift is gone — leaving them set let a
+    // stale offset be applied to correct coordinates, opening an editor a line
+    // off and merging two paragraphs into one.
+    this.lineDelta = 0;
+    this.commitEnd = -1;
     const src = this.host.content();
     const lines = src.split("\n");
     const blocks = segmentBlocks(src);
@@ -419,8 +429,8 @@ export class BlockView {
     const textarea = document.createElement("textarea");
     textarea.value = text;
     textarea.spellcheck = false;
-    // this block's own counter, under its editor — every mutation below either
-    // fires input (typing, the link button) or lands in sizeTextarea
+    // this block's own counter, under its editor — every mutation below reaches
+    // it through the textarea's input listener, whether typed or from a button
     const counter = document.createElement("div");
     counter.className = "block-count";
     // Trails typing rather than tracking it: counting is a whole-text regex
@@ -458,8 +468,12 @@ export class BlockView {
           return;
         }
         textarea.value = convertBlock(textarea.value, tool.t);
-        this.sizeTextarea(textarea);
-        syncCounter();
+        // Assigning .value fires no input event, so this has to say so itself:
+        // otherwise retyping a block and putting the phone down left the change
+        // in a detached textarea, unsaved and undirty, for an OS kill to take.
+        // The one listener does the resize, the recount, the live flush, and
+        // lets app.ts see it — the same route insertWikiLink takes.
+        textarea.dispatchEvent(new Event("input", { bubbles: true }));
         textarea.focus();
         const firstLineEnd = textarea.value.includes("\n") ? textarea.value.indexOf("\n") : textarea.value.length;
         textarea.setSelectionRange(firstLineEnd, firstLineEnd);
@@ -499,8 +513,10 @@ export class BlockView {
     if (e.key !== "Enter" || e.shiftKey) return;
 
     const value = textarea.value;
-    if (this.active?.append && value.trim() === "") {
-      e.preventDefault(); // Enter in an empty append editor must not spray blanks
+    // Enter in an empty append editor must not spray blanks — including one that
+    // has already written and then had its text cleared again.
+    if ((this.active?.append || this.active?.wasAppend) && value.trim() === "") {
+      e.preventDefault();
       return;
     }
     const blk = segmentBlocks(value).find((b) => b.type !== "blank");
@@ -578,12 +594,31 @@ export class BlockView {
           a.start = lines.length + 1; // after the separating blank
           lines.push("", ...newLines);
           a.append = false;
+          a.wasAppend = true;
           a.end = a.start + newLines.length - 1;
+          // Re-base onto the lines just written. Left at MAX_SAFE_INTEGER (what
+          // an append starts with, since nothing rendered covers it) every later
+          // flush would compute a nonsense lineDelta and wedge staleShifted true,
+          // which silently drops link taps and checkbox toggles.
+          a.domEnd = a.end;
           this.lineDelta = 0;
           // appended past everything rendered, so no block's coordinates moved
           this.commitEnd = Number.MAX_SAFE_INTEGER;
           this.host.update(lines.join("\n"));
         }
+      } else if (a.wasAppend && value.trim() === "") {
+        // An appended block emptied again: take the lines back out, separating
+        // blank and all, and go back to appending. Splicing "" in would leave
+        // blank lines the user never typed, and every repeat would add more.
+        lines.splice(a.start - 1, a.end - a.start + 2);
+        a.append = true;
+        a.wasAppend = false;
+        a.start = -1;
+        a.end = -1;
+        a.domEnd = Number.MAX_SAFE_INTEGER;
+        this.lineDelta = 0;
+        this.commitEnd = Number.MAX_SAFE_INTEGER;
+        this.host.update(lines.join("\n"));
       } else {
         lines.splice(a.start, a.end - a.start + 1, ...newLines);
         a.end = a.start + newLines.length - 1;
@@ -608,7 +643,11 @@ export class BlockView {
     }
     this.active = null;
     if (renderAfter) this.rerenderKeepScroll();
-    else this.staleDom = true;
+    // Only a session that actually wrote something leaves the DOM out of step.
+    // Marking it stale regardless meant a look-but-don't-touch visit to a block
+    // resurrected the previous session's line offset and applied it to
+    // coordinates that were already correct.
+    else this.staleDom = this.staleDom || changed;
     return changed;
   }
 

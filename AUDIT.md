@@ -344,6 +344,107 @@ The four items left open above were closed in a second pass.
   WebView, but shared-storage I/O on Android goes through a FUSE shim this machine doesn't
   have. The file-reading numbers specifically could be worse there.
 
+## Review round
+
+An adversarial review of the fixes themselves found 19 further defects, most of
+them introduced by the fixes. What follows is the record; all but three are fixed.
+
+### It lost data, or corrupted it
+
+- **The Dropbox mirror added a carriage return per line, per sync**
+  (`src-tauri/src/lib.rs`). `write_note` re-expanded `\n` to `\r\n` for a CRLF file
+  without checking whether the incoming content was *already* CRLF — and the mirror
+  hands over bytes straight off the server. A CRLF note re-synced once became `\r\r\n`
+  on every line, then got uploaded back to every device. The write path now normalizes
+  its input instead of trusting it.
+- **A remote delete wiped an edit that hadn't been uploaded** (`dropboxsync.ts`). The
+  "never overwrite an unsent edit" guard sat *after* the deletion branch, so a note
+  renamed or tidied away on another device removed the local file — the only copy of an
+  edit made offline. The guard now covers deletes too.
+- **A conflict destroyed the local text before the user had answered**
+  (`dropboxsync.ts`). `pushNote` downloaded the server copy over the mirror and cleared
+  the outbox entry *while opening the dialog*. If the app died with the prompt up, or the
+  user never answered, their text was already gone. `pushNote` now only reports; a new
+  `resolveConflict` is the only thing that writes, and only after a choice is made.
+- **"Keep mine" could silently become "take theirs"** (`app.ts`). The re-push's result was
+  discarded, so a third device changing the note while the dialog sat open inverted the
+  user's answer with no prompt and no message.
+- **Retyping a block with the toolbar was never saved** (`blockview.ts`). The ¶/H1/•/☑
+  buttons assign `textarea.value`, which fires no input event, so nothing marked the note
+  dirty. Convert a paragraph to a to-do, put the phone down, and an OS kill took it — the
+  exact loss class the autosave work existed to close. They now go through the same input
+  event as typing.
+- **A second ⌘Q abandoned the flush the first one started** (`src-tauri/src/lib.rs`). A
+  deferred quit looks like the app ignoring you, so pressing again is natural — and the
+  second press skipped `prevent_exit` and killed the process mid-save.
+- **The quit flush could park behind a stuck upload** (`app.ts`). `save()` queues, and in
+  Dropbox mode the head of that queue can be an upload with no timeout, so the watchdog
+  force-exited with the text still in memory. The flush now writes to disk directly first
+  and lets the upload be owed.
+- **Two Carnet processes could splice each other's writes** (`src-tauri/src/lib.rs`).
+  `TMP_SEQ` only counts within one process, and the temp file was opened with `truncate`.
+  Temp names now carry the pid and are created with `create_new`, so a collision fails
+  loudly instead of publishing half of each writer's file.
+
+### It went quietly wrong
+
+- **A blank white screen for minutes on the phone** (`dropboxmode.ts`) — reported from a
+  real device while this was being written. `start()` awaited the whole initial sync
+  before `startApp()` ran, and on a relaunch no setup screen was showing either, so a
+  10,000-note first sync meant minutes of nothing at all. The loop does the initial sync
+  now and the UI comes up immediately against whatever the mirror holds; a note that
+  hasn't arrived shows a placeholder with a live count instead of a 6-second toast, and
+  opens by itself when it lands.
+- **A single mid-read save could leave the app wrong for the session**
+  (`vault-cache.ts`). A whole-vault read that started before an invalidation still
+  published its stale snapshot afterwards, and the save had already recorded its mtime as
+  seen — so the one thing that would have noticed, the next listing, never did. Backlinks,
+  the graph and full-text search stayed wrong until restart. Reads and builds now carry a
+  generation and discard themselves if the vault moved under them.
+- **A refresh arriving during a refresh was dropped** (`app.ts`). Listing 10,000 files
+  takes long enough that a Dropbox delta lands mid-walk; the walk in progress never saw
+  it and the request was discarded. The note existed on disk but not in the path list, so
+  a link to it resolved nowhere and tapping it created a *second* copy elsewhere.
+  Refreshes now coalesce.
+- **Five seconds of typing turned the debounce off** (`app.ts`). The unsaved-time cap was
+  measured from the first unsaved edit and never re-armed while a save was in flight, so
+  after five seconds of uninterrupted writing every keystroke forced a fresh write and
+  upload. The cap now restarts when a save is issued.
+- **Emptying an appended block wrote blank lines into the note** (`blockview.ts`). The
+  first live flush cleared the `append` flag, which is what two other rules depended on;
+  clearing the text then spliced blanks in, and Enter sprayed two more per press.
+- **A line offset outlived the DOM it was measured against** (`blockview.ts`). `render()`
+  reset the stale flags but not `lineDelta`/`commitEnd`, and a look-but-don't-touch visit
+  to a block marked the DOM stale anyway — so a later tap opened the editor one line off
+  and typing merged two paragraphs into one.
+- **One appended block, two flushes, and every link and checkbox went dead**
+  (`blockview.ts`). `domEnd` was never re-based when `append` flipped off, so `lineDelta`
+  became about -9e15 and `staleShifted` stuck true, silently swallowing taps.
+- **One stray CRLF rewrote every line ending in the file** (`src-tauri/src/lib.rs`). A
+  single `\r\n` pasted into a code fence made the next save convert the whole file,
+  turning a one-word edit into a whole-file diff. Only a uniformly-CRLF file is restored
+  as CRLF now.
+
+### Still open
+
+Three need a design decision rather than a fix, so they are deliberately not in this round:
+
+1. **A non-UTF-8 note is now unsaveable, and says so only in a 3-second toast.** Refusing
+   to overwrite it (above) traded silent corruption for a different loss: a Latin-1 note
+   accepts typing, fails every autosave, and ⌘Q discards the lot. The honest fix is to
+   detect it on open — `read_note` reporting `valid_utf8: false` — and put the note in a
+   read-only state with a persistent banner and an explicit "re-save as UTF-8" action.
+   That is a UI decision about what should happen to such a note.
+2. **An owed edit that also changed remotely is wedged.** `drainOutbox` re-uploads against
+   the live rev map, which can never advance past the conflict, while the pull consumes and
+   discards the delta — so the note stays out of sync in both directions and "open it to
+   resolve" does nothing. The fix is for each outbox entry to carry the base rev its edit
+   was made against, and for a drain-time conflict to reach the same interactive prompt a
+   foreground save does, without the cursor advancing past the skipped delta.
+3. **`⌘Q` and the asset-protocol grant still need a device.** Neither path can be
+   exercised on Linux. The 2 s watchdog bounds the first; a failed grant surfaces as a
+   toast rather than silently broken images.
+
 ## Fix order
 
 Data loss first, then what unblocks 10,000 notes, then polish.

@@ -170,6 +170,146 @@ describe("BlockView", () => {
     expect(state.content).toBe("first words in a brand new note");
   });
 
+  // --- regressions the continuous flush introduced -----------------------
+
+  test("typing then clearing an appended block leaves the note as it was", async () => {
+    const original = "# Journal\n\nSome existing text.";
+    const { state, host } = makeHost(original);
+    const view = new BlockView(container, host);
+    view.render();
+    // tapping the empty space below the note opens an append editor
+    container.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    const ta = container.querySelector("textarea") as HTMLTextAreaElement;
+    expect(ta).toBeTruthy();
+    Object.defineProperty(document, "activeElement", { value: ta, configurable: true });
+
+    type("note"); // first flush appends it
+    await settle(500);
+    type(""); // changed my mind
+    await settle(500);
+
+    expect(state.content).toBe(original);
+  });
+
+  test("Enter in an emptied append editor does not spray blank lines", async () => {
+    const original = "# Journal\n\nSome existing text.";
+    const { state, host } = makeHost(original);
+    const view = new BlockView(container, host);
+    view.render();
+    container.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    const ta = container.querySelector("textarea") as HTMLTextAreaElement;
+    Object.defineProperty(document, "activeElement", { value: ta, configurable: true });
+
+    type("note");
+    await settle(500);
+    type("");
+    await settle(500);
+    for (let i = 0; i < 2; i++) {
+      ta.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    }
+    expect(state.content).toBe(original);
+  });
+
+  test("a line offset from one session never applies to a later re-rendered one", async () => {
+    // p0..p8, one line each, blank-separated: p6 is line 12, p7 line 14
+    const paras = Array.from({ length: 9 }, (_, i) => `p${i}`).join("\n\n");
+    const { state, host } = makeHost(paras);
+    const view = new BlockView(container, host);
+    view.render();
+
+    // 1. grow p1 by a line, so a +1 offset is recorded
+    view.openRange(2, 2, 0);
+    let ta = container.querySelector("textarea") as HTMLTextAreaElement;
+    Object.defineProperty(document, "activeElement", { value: ta, configurable: true });
+    type("p1\nsecond line");
+    await settle(500);
+
+    // 2. move to a later block, changing nothing — this re-renders
+    view.openRange(8, 8, 0);
+    ta = container.querySelector("textarea") as HTMLTextAreaElement;
+    Object.defineProperty(document, "activeElement", { value: ta, configurable: true });
+    const afterGrow = state.content;
+
+    // 3. tap p6 (now at line 13) and rewrite it
+    const p6 = [...container.querySelectorAll<HTMLElement>("[data-start]")].find(
+      (el) => el.textContent?.trim() === "p6",
+    );
+    expect(p6).toBeTruthy();
+    p6!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    ta = container.querySelector("textarea") as HTMLTextAreaElement;
+    Object.defineProperty(document, "activeElement", { value: ta, configurable: true });
+    expect(ta.value).toBe("p6"); // not the blank line after it
+    type("REWRITTEN");
+    await settle(500);
+
+    // p6 replaced, and p7 still its own paragraph
+    expect(state.content).toBe(afterGrow.replace("p6", "REWRITTEN"));
+    expect(state.content).toContain("REWRITTEN\n\np7");
+  });
+
+  test("checkboxes still work after two flushes of an appended block", async () => {
+    const { state, host } = makeHost("- [ ] alpha\n- [ ] beta\n\ntail para");
+    const view = new BlockView(container, host);
+    view.render();
+    container.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    let ta = container.querySelector("textarea") as HTMLTextAreaElement;
+    Object.defineProperty(document, "activeElement", { value: ta, configurable: true });
+
+    type("a new thought");
+    await settle(500);
+    type("a new thought, extended");
+    await settle(500);
+
+    // leave the editor the way tapping elsewhere would, then tick alpha
+    view.commit();
+    const box = container.querySelector('input[type="checkbox"]') as HTMLInputElement;
+    expect(box).toBeTruthy();
+    box.checked = true;
+    box.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(state.content).toContain("- [x] alpha");
+  });
+
+  test("retyping a block with the toolbar marks the note dirty", async () => {
+    const { state, host } = makeHost("# Title\n\nbuy milk");
+    const view = new BlockView(container, host);
+    view.render();
+    view.openRange(2, 2, 0);
+    const ta = container.querySelector("textarea") as HTMLTextAreaElement;
+    Object.defineProperty(document, "activeElement", { value: ta, configurable: true });
+
+    // ☑ turns the paragraph into a to-do
+    const todo = [...container.querySelectorAll("button")].find((b) => b.title === "To-do");
+    expect(todo).toBeTruthy();
+    todo!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+
+    // ...and that must reach the note on its own, like typing does
+    await settle(500);
+    expect(state.content).toContain("- [ ] buy milk");
+  });
+
+  test("every retype button reaches the note without further typing", async () => {
+    for (const [title, expected] of [
+      ["Heading 1", "# buy milk"],
+      ["Heading 2", "## buy milk"],
+      ["Bullet list", "- buy milk"],
+      ["Quote", "> buy milk"],
+    ] as const) {
+      document.body.innerHTML = "";
+      container = document.createElement("div");
+      document.body.appendChild(container);
+      const { state, host } = makeHost("intro\n\nbuy milk");
+      const view = new BlockView(container, host);
+      view.render();
+      view.openRange(2, 2, 0);
+      const ta = container.querySelector("textarea") as HTMLTextAreaElement;
+      Object.defineProperty(document, "activeElement", { value: ta, configurable: true });
+      const btn = [...container.querySelectorAll("button")].find((b) => b.title === title);
+      btn!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await settle(500);
+      expect(state.content).toContain(expected);
+    }
+  });
+
   test("committing twice does not write twice", () => {
     const { state, host } = makeHost("# Title\n\nbody");
     const view = new BlockView(container, host);
