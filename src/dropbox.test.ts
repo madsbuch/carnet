@@ -59,6 +59,9 @@ class MemStore implements Store {
   remove(k: string): void {
     this.map.delete(k);
   }
+  keys(): string[] {
+    return [...this.map.keys()];
+  }
 }
 
 class MemMirror implements Mirror {
@@ -70,6 +73,9 @@ class MemMirror implements Mirror {
   }
   async remove(rel: string): Promise<void> {
     this.files.delete(rel);
+  }
+  async read(rel: string): Promise<string | null> {
+    return this.files.get(rel) ?? null;
   }
 }
 
@@ -227,6 +233,25 @@ describe("DropboxClient", () => {
     expect(out).toEqual({ rev: "r2" });
     const arg = JSON.parse((calls[0]!.init!.headers as Record<string, string>)["Dropbox-API-Arg"]!);
     expect(arg.mode).toEqual({ ".tag": "update", update: "r1" });
+  });
+
+  test("upload with no base rev claims the file is new instead of overwriting", async () => {
+    const { fetch, calls } = fakeFetch(() => json({ rev: "r2" }));
+    const c = new DropboxClient(tokens(), "APPKEY", "", fetch);
+    await c.upload("a.md", "x", undefined);
+    const arg = JSON.parse((calls[0]!.init!.headers as Record<string, string>)["Dropbox-API-Arg"]!);
+    // "overwrite" here silently destroyed the remote note whenever the local
+    // rev had been lost (killed app, torn state blob, half-synced mirror).
+    expect(arg.mode).toEqual({ ".tag": "add" });
+    expect(arg.autorename).toBe(false);
+  });
+
+  test("an unconditional upload onto an existing file is a conflict, not a clobber", async () => {
+    const { fetch } = fakeFetch(
+      () => new Response('{"error_summary":"path/conflict/file/..."}', { status: 409 }),
+    );
+    const c = new DropboxClient(tokens(), "APPKEY", "", fetch);
+    await expect(c.upload("a.md", "x", undefined)).rejects.toBeInstanceOf(WriteConflict);
   });
 
   test("longpoll uses the notify host with no auth header", async () => {
@@ -394,6 +419,111 @@ describe("DropboxSync", () => {
     expect(store.get("carnet.dropbox.cursor")).toBe("C2");
     // the dead rev key is removed, not left as an empty string
     expect(store.get("carnet.dropbox.rev.a.md")).toBeNull();
+  });
+
+  test("a push that fails offline stays owed and is re-sent later", async () => {
+    let online = false;
+    const h = harness((url) => {
+      if (url.endsWith("/upload")) {
+        if (!online) throw new Error("network down");
+        return json({ rev: "r9" });
+      }
+      return json({});
+    });
+    await h.mirror.write("a.md", "written offline");
+    await expect(h.sync.pushNote("a.md", "written offline", undefined)).rejects.toThrow();
+    // the edit is the only copy of that text — it must not simply be forgotten
+    expect(h.sync.pendingUploads()).toBe(1);
+
+    online = true;
+    await h.sync.drainOutbox();
+    expect(h.sync.pendingUploads()).toBe(0);
+    expect(h.sync.revOf("a.md")).toBe("r9");
+  });
+
+  test("draining forgets a note that is gone locally rather than retrying forever", async () => {
+    const h = harness((url) => {
+      if (url.endsWith("/upload")) throw new Error("network down");
+      return json({});
+    });
+    // never written to the mirror, so there is nothing left to send
+    await expect(h.sync.pushNote("ghost.md", "x", undefined)).rejects.toThrow();
+    expect(h.sync.pendingUploads()).toBe(1);
+    await h.sync.drainOutbox();
+    expect(h.sync.pendingUploads()).toBe(0);
+  });
+
+  test("a drained note that also moved on Dropbox is reported, never overwritten", async () => {
+    const h = harness((url) => {
+      if (url.endsWith("/upload")) {
+        if (uploads++ === 0) throw new Error("network down");
+        return new Response('{"error_summary":"path/conflict"}', { status: 409 });
+      }
+      return json({});
+    });
+    let uploads = 0;
+    await h.mirror.write("a.md", "my offline edit");
+    await expect(h.sync.pushNote("a.md", "my offline edit", undefined)).rejects.toThrow();
+
+    await h.sync.drainOutbox();
+    // the local text is the only copy of that edit: leave it alone and say so
+    expect(await h.mirror.read("a.md")).toBe("my offline edit");
+    expect(h.sync.pendingUploads()).toBe(1);
+    expect(h.errors.join(" ")).toContain("a.md");
+  });
+
+  test("one unsendable note does not block the rest of the queue forever", async () => {
+    const h = harness((url) => {
+      if (url.endsWith("/upload")) throw new Error("network down");
+      return json({});
+    });
+    await h.mirror.write("a.md", "one");
+    await h.mirror.write("b.md", "two");
+    await expect(h.sync.pushNote("a.md", "one", undefined)).rejects.toThrow();
+    await expect(h.sync.pushNote("b.md", "two", undefined)).rejects.toThrow();
+    expect(h.sync.pendingUploads()).toBe(2);
+    await h.sync.drainOutbox(); // still offline: both stay owed, nothing is lost
+    expect(h.sync.pendingUploads()).toBe(2);
+  });
+
+  test("a pull will not overwrite a note whose upload is still owed", async () => {
+    const h = harness((url) => {
+      if (url.endsWith("/upload")) throw new Error("network down");
+      if (url.endsWith("/list_folder"))
+        return json({
+          entries: [{ ".tag": "file", path_display: "/a.md", rev: "rServer" }],
+          cursor: "C1",
+          has_more: false,
+        });
+      return new Response("the server's version", {
+        status: 200,
+        headers: { "Dropbox-API-Result": '{"rev":"rServer"}' },
+      });
+    });
+    await h.mirror.write("a.md", "my only copy of this edit");
+    await expect(h.sync.pushNote("a.md", "my only copy of this edit", undefined)).rejects.toThrow();
+
+    // a remote change to the same note arrives before the edit could be sent
+    await h.sync.initialSync();
+
+    expect(await h.mirror.read("a.md")).toBe("my only copy of this edit");
+    expect(h.sync.pendingUploads()).toBe(1);
+    expect(h.errors.join(" ")).toContain("a.md");
+  });
+
+  test("isSynced only becomes true once a full listing has landed", async () => {
+    const h = harness((url) => {
+      if (url.endsWith("/list_folder"))
+        return json({
+          entries: [{ ".tag": "file", path_display: "/a.md", rev: "r1" }],
+          cursor: "C1",
+          has_more: false,
+        });
+      return new Response("body", { status: 200, headers: { "Dropbox-API-Result": '{"rev":"r1"}' } });
+    });
+    expect(h.sync.isSynced()).toBe(false);
+    await h.sync.initialSync();
+    expect(h.sync.isSynced()).toBe(true);
   });
 
   test("pushNote records the returned rev on success", async () => {

@@ -1,8 +1,20 @@
 import { ask } from "@tauri-apps/plugin-dialog";
 import { homeDir } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { basename, contentHash, DAILY_RE, dirOf, fuzzyScore, normalizePath, noteTitle, resolveLink } from "../links";
-import { buildGraph, dailyPath, searchNotes, type GraphData } from "../graph-data";
+import { listen } from "@tauri-apps/api/event";
+import {
+  basename,
+  buildLinkIndex,
+  contentHash,
+  DAILY_RE,
+  dirOf,
+  fuzzyScore,
+  normalizePath,
+  noteTitle,
+  type LinkIndex,
+} from "../links";
+import { dailyPath, searchNotes } from "../graph-data";
+import { VaultIndex } from "../vault-index";
 import { countLabel } from "../counts";
 import * as backend from "./backend";
 import * as dropbox from "./dropboxmode";
@@ -38,8 +50,6 @@ let note: backend.Note | null = null;
 let loadedHash: string | null = null;
 let dirty = false;
 let editing = false; // raw source mode; block editing lives in blockView
-let allNotesCache: backend.Note[] | null = null;
-let graphCache: GraphData | null = null;
 let lastNoteHash = "";
 let started = false;
 let loadSeq = 0;
@@ -73,10 +83,10 @@ const blockView = new BlockView(previewEl, {
     note.content = next;
     dirty = true;
     updateDirty();
-    updateNoteCount();
+    scheduleNoteCount();
     scheduleSave();
   },
-  wikiExists: (name) => note !== null && resolveLink(name, note.path, paths) !== null,
+  wikiExists: (name) => note !== null && linkIndex.has(name, note.path),
   followWiki: (name) => followWiki(name),
   openRelative: (href) => {
     if (note) openPath(normalizePath(dirOf(note.path) + safeDecode(href)));
@@ -88,19 +98,85 @@ const blockView = new BlockView(previewEl, {
   },
 });
 
-/* ---------- caches ---------- */
+/* ---------- caches ----------
+ * Three things are cached, with three different lifetimes:
+ *
+ * - `linkIndex` answers "does [x] exist?" from the path list alone. The
+ *   renderer needs that answer synchronously for every wiki link, so it can't
+ *   wait on note bodies.
+ * - `notesValue` is every note's text. It is fetched once and then PATCHED on
+ *   save; it used to be thrown away on every save, which meant re-reading and
+ *   re-parsing the whole vault before the next backlinks render.
+ * - `vaultValue` is the link structure over those bodies. Saving a note edits
+ *   it in place — O(links in that note) rather than O(vault).
+ *
+ * The in-flight read is shared (`notesPromise`), because the old code cached
+ * the resolved value and so let concurrent callers each start their own
+ * whole-vault read. */
 
+let linkIndex: LinkIndex = buildLinkIndex([]);
+/** Resolved note bodies, once loaded. Kept as a plain array so a save can
+ *  patch it synchronously. */
+let notesValue: backend.Note[] | null = null;
+/** The read in flight, shared so concurrent callers don't each start one. */
+let notesPromise: Promise<backend.Note[]> | null = null;
+let vaultValue: VaultIndex | null = null;
+/** Path + mtime of every note as last seen, so a focus that changed nothing
+ *  costs one directory walk and no JS work at all. */
+let lastMeta: backend.NoteMeta[] = [];
+
+/** Adopt a new path list. Anything derived only from paths is rebuilt here. */
+function setPaths(next: string[]): void {
+  paths = next;
+  linkIndex = buildLinkIndex(paths);
+}
+
+/** The set of notes itself changed, so links may resolve differently. */
 function invalidate(): void {
-  allNotesCache = null;
-  graphCache = null;
+  notesValue = null;
+  notesPromise = null;
+  vaultValue = null;
 }
 
-async function getAllNotes(): Promise<backend.Note[]> {
-  return (allNotesCache ??= await backend.readAllNotes());
+function getAllNotes(): Promise<backend.Note[]> {
+  if (notesValue) return Promise.resolve(notesValue);
+  return (notesPromise ??= backend.readAllNotes().then(
+    (loaded) => {
+      notesValue = loaded;
+      notesPromise = null;
+      return loaded;
+    },
+    (e: unknown) => {
+      notesPromise = null; // a failed read must not cache itself forever
+      throw e;
+    },
+  ));
 }
 
-async function getGraph(): Promise<GraphData> {
-  return (graphCache ??= buildGraph(await getAllNotes()));
+async function getVault(): Promise<VaultIndex> {
+  const loaded = await getAllNotes();
+  return (vaultValue ??= new VaultIndex(loaded));
+}
+
+/** A note was written. Patch what's cached rather than dropping it: only this
+ *  note's own links can have moved, and the file's new mtime is ours, not a
+ *  change from another device. */
+function noteSaved(path: string, content: string, mtime: number): void {
+  const meta = lastMeta.find((m) => m.path === path);
+  if (meta) meta.mtime = mtime;
+  if (notesPromise) {
+    // A whole-vault read is in flight and may or may not have seen this write.
+    // Not worth reconciling: drop the caches and let it be re-read on demand.
+    invalidate();
+    return;
+  }
+  if (!notesValue) return;
+  const hit = notesValue.find((n) => n.path === path);
+  if (hit) {
+    hit.content = content;
+    hit.mtime = mtime;
+  }
+  if (vaultValue?.knows(path)) vaultValue.setContent(path, content);
 }
 
 /* ---------- toast ---------- */
@@ -122,12 +198,22 @@ function errText(e: unknown): string {
 /* ---------- saving ---------- */
 
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
+/** When the note first went dirty, or 0 if it isn't. */
+let dirtySince = 0;
+/** Longest anything may stay unwritten. A plain debounce never fires while you
+ *  keep typing, so a long uninterrupted stretch of writing would sit entirely
+ *  in memory — exactly the writing worth not losing. */
+const MAX_UNSAVED_MS = 5000;
+
 function scheduleSave(): void {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => void save(), 800);
+  if (!dirtySince) dirtySince = Date.now();
+  const wait = Math.min(800, Math.max(0, dirtySince + MAX_UNSAVED_MS - Date.now()));
+  saveTimer = setTimeout(() => void save(), wait);
 }
 
 function updateDirty(): void {
+  if (!dirty) dirtySince = 0; // the clock restarts with the next edit
   $("#dirty-dot").hidden = !dirty;
 }
 
@@ -167,19 +253,19 @@ async function doSave(): Promise<void> {
           updateDirty();
           reshowNote();
         }
-        invalidate();
+        noteSaved(n.path, res.content, res.mtime);
         return;
       }
     }
     if (res.status === "ok") {
       n.mtime = res.mtime;
       if (note === n) loadedHash = contentHash(contentAtSave);
+      noteSaved(n.path, contentAtSave, res.mtime);
     }
     if (note === n && n.content === contentAtSave) {
       dirty = false;
       updateDirty();
     }
-    invalidate();
     await pushToDropbox(n, contentAtSave, baseRev);
   } catch (e) {
     toast("Save failed: " + e);
@@ -258,7 +344,7 @@ async function loadNote(path: string): Promise<void> {
   // re-selecting the current note (sidebar, graph exit) must not blow away
   // an in-progress edit or re-render under the user
   if (note?.path === path && (dirty || editing || blockView.hasActiveEdit())) {
-    renderTree();
+    markTreeDirty();
     return;
   }
   blockView.flush(); // end any edit session — it must not survive into another note
@@ -270,6 +356,14 @@ async function loadNote(path: string): Promise<void> {
     if (seq !== loadSeq) return;
     let created = false;
     if (!n) {
+      // While the Dropbox mirror is still filling up, a note that simply hasn't
+      // downloaded yet looks exactly like one that doesn't exist. Creating it
+      // would put an empty file in its place and then push that over the real
+      // note, so wait for the mirror instead.
+      if (dropboxSync && !dropbox.isSynced()) {
+        toast("Still fetching your notes from Dropbox — open this one again in a moment", 6000);
+        return;
+      }
       // baseMtime 0: if the file appears concurrently (Dropbox sync), the
       // write conflicts instead of wiping it — then adopt the disk version
       const res = await backend.writeNote(path, "", 0);
@@ -282,10 +376,12 @@ async function loadNote(path: string): Promise<void> {
         toast("Created " + path);
       }
       if (!paths.includes(path)) {
-        paths.push(path);
-        paths.sort();
+        setPaths([...paths, path].sort());
+        lastMeta = [...lastMeta, { path, mtime: n.mtime }].sort((a, b) =>
+          a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
+        );
       }
-      invalidate();
+      invalidate(); // a new path can make links elsewhere resolve
     }
     note = n;
     loadedHash = contentHash(n.content);
@@ -302,7 +398,7 @@ async function loadNote(path: string): Promise<void> {
 
 async function openGraph(): Promise<void> {
   try {
-    const g = await getGraph();
+    const g = (await getVault()).graph();
     if (location.hash !== "#/graph") return; // user already navigated away
     graphView.show(g, note?.path ?? null);
   } catch (e) {
@@ -312,7 +408,7 @@ async function openGraph(): Promise<void> {
 
 function followWiki(name: string): void {
   if (!note) return;
-  const target = resolveLink(name, note.path, paths);
+  const target = linkIndex.resolve(name, note.path);
   if (target) openPath(target);
   else if (name.includes("/")) openPath(normalizePath(name) + ".md");
   else openPath(dirOf(note.path) + name + ".md");
@@ -329,7 +425,7 @@ function renderAll(): void {
   if (editing) showEditor();
   else showPreview(false);
   updateNoteCount(); // after the mode switch: it reads the live block editor
-  renderTree();
+  markTreeDirty(); // the "current note" highlight moved
 }
 
 function renderPreview(): void {
@@ -355,20 +451,28 @@ function updateNoteCount(): void {
   countEl.hidden = label === "";
 }
 
+// Counting walks the whole note with a Unicode-property regex — 3.7 ms at
+// 200 KB, ~19 ms on a phone. That is far too much to spend per keystroke for
+// an ambient number, so it trails typing instead of tracking it.
+let countTimer: ReturnType<typeof setTimeout> | undefined;
+function scheduleNoteCount(): void {
+  clearTimeout(countTimer);
+  countTimer = setTimeout(updateNoteCount, 200);
+}
+
 async function renderBacklinks(): Promise<void> {
   if (!note) {
     backlinksEl.hidden = true;
     return;
   }
   const forPath = note.path;
-  let g: GraphData;
+  let sources: string[];
   try {
-    g = await getGraph();
+    sources = (await getVault()).backlinks(forPath);
   } catch {
     return;
   }
   if (note?.path !== forPath || editing) return;
-  const sources = [...new Set(g.edges.filter((e) => e.target === forPath).map((e) => e.source))].sort();
   backlinksEl.hidden = sources.length === 0;
   const ul = backlinksEl.querySelector("ul")!;
   ul.innerHTML = "";
@@ -425,6 +529,28 @@ function showPreview(saveFirst = true): void {
 interface DirNode {
   dirs: Map<string, DirNode>;
   files: string[];
+}
+
+/* The tree is one <a> per note plus a listener each — 10,000 elements and
+ * 144 ms of DOM work at scale, for a panel that lives behind the hamburger and
+ * on a phone is never shown at all (the full-screen files view replaces it).
+ * So it is marked dirty and only built when it can actually be seen. */
+let treeDirty = true;
+
+function treeShowing(): boolean {
+  if (libraryEl.parentElement === qoBrowse) return !qoEl.hidden && !qoBrowse.hidden;
+  return document.body.classList.contains("sidebar-open");
+}
+
+function markTreeDirty(): void {
+  treeDirty = true;
+  ensureTree(); // builds now only if it's on screen
+}
+
+function ensureTree(): void {
+  if (!treeDirty || !treeShowing()) return;
+  treeDirty = false;
+  renderTree();
 }
 
 function renderTree(): void {
@@ -484,6 +610,7 @@ function toggleSidebar(): void {
   }
   const open = document.body.classList.toggle("sidebar-open");
   $("#backdrop").hidden = !open;
+  if (open) ensureTree();
 }
 
 function closeSidebar(): void {
@@ -538,6 +665,7 @@ function updateQuickOpen(q: string): void {
   const browsing = q === "" && libraryEl.parentElement === qoBrowse;
   qoBrowse.hidden = !browsing;
   if (browsing) {
+    ensureTree(); // the files view is where the tree lives on a phone
     qoItems = [];
     renderQoItems();
     return;
@@ -662,25 +790,66 @@ async function applySafeArea(): Promise<void> {
 
 /* ---------- refresh on focus (Dropbox may have synced) ---------- */
 
-async function refreshFromDisk(): Promise<void> {
-  if (!started || !backend.vaultRoot()) return;
-  invalidate();
-  try {
-    paths = await backend.listNotes();
-  } catch {
-    return;
+function sameMeta(a: backend.NoteMeta[], b: backend.NoteMeta[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].path !== b[i].path || a[i].mtime !== b[i].mtime) return false;
   }
-  renderTree();
-  if (!note || dirty || blockView.hasActiveEdit()) return;
-  const before = note;
-  const fresh = await backend.readNote(note.path).catch(() => null);
-  // the world may have moved while we awaited — re-check everything
-  if (!fresh || note !== before || dirty || blockView.hasActiveEdit()) return;
-  if (fresh.mtime !== note.mtime) {
-    note = fresh;
-    loadedHash = contentHash(fresh.content);
-    reshowNote();
-    toast("Updated from disk");
+  return true;
+}
+
+// focus and visibilitychange both fire on returning to the app, which used to
+// mean two concurrent whole-vault reads racing each other.
+let refreshTimer: ReturnType<typeof setTimeout> | undefined;
+let refreshing = false;
+
+function scheduleRefresh(): void {
+  clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(() => void refreshFromDisk(), 120);
+}
+
+/**
+ * Pick up changes made outside the app. The vault's path+mtime list is cheap
+ * (one directory walk, no file bodies), so the common case — nothing changed
+ * while you were away — costs that and nothing else. Only a real change drops
+ * the caches.
+ */
+async function refreshFromDisk(): Promise<void> {
+  if (!started || !backend.vaultRoot() || refreshing) return;
+  refreshing = true;
+  try {
+    let meta: backend.NoteMeta[];
+    try {
+      meta = await backend.listNotesMeta();
+    } catch {
+      return;
+    }
+    if (!sameMeta(meta, lastMeta)) {
+      const nextPaths = meta.map((m) => m.path);
+      const pathsMoved =
+        nextPaths.length !== paths.length || nextPaths.some((p, i) => p !== paths[i]);
+      lastMeta = meta;
+      invalidate(); // some note's text moved, so the link structure may have too
+      if (pathsMoved) {
+        setPaths(nextPaths);
+        markTreeDirty();
+      }
+    }
+    if (!note || dirty || blockView.hasActiveEdit()) return;
+    const known = lastMeta.find((m) => m.path === note!.path);
+    if (known && known.mtime === note.mtime) return; // the open note is current
+    const before = note;
+    const fresh = await backend.readNote(note.path).catch(() => null);
+    // the world may have moved while we awaited — re-check everything
+    if (!fresh || note !== before || dirty || blockView.hasActiveEdit()) return;
+    if (fresh.mtime !== note.mtime) {
+      note = fresh;
+      loadedHash = contentHash(fresh.content);
+      reshowNote();
+      toast("Updated from disk");
+    }
+  } finally {
+    refreshing = false;
   }
 }
 
@@ -891,14 +1060,14 @@ editorEl.addEventListener("input", () => {
   note.content = editorEl.value;
   dirty = true;
   updateDirty();
-  updateNoteCount();
+  scheduleNoteCount();
   scheduleSave();
   autoSize();
 });
 
 // Block editors live inside #preview and their input events bubble, so the
 // note's counter follows a block being typed without waiting for the commit.
-previewEl.addEventListener("input", () => updateNoteCount());
+previewEl.addEventListener("input", () => scheduleNoteCount());
 
 document.addEventListener("keydown", (e) => {
   if (!started && setupEl.hidden === false) return;
@@ -946,7 +1115,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 window.addEventListener("focus", () => {
-  void refreshFromDisk();
+  scheduleRefresh();
   void refreshSetupChecks();
 });
 document.addEventListener("visibilitychange", () => {
@@ -954,16 +1123,22 @@ document.addEventListener("visibilitychange", () => {
     blockView.commit(false);
     void save();
   } else {
-    void refreshFromDisk();
+    scheduleRefresh();
     void refreshSetupChecks();
     void applySafeArea(); // rotation may have changed the bars
   }
+});
+// Android can kill a backgrounded app outright, so take the last chance the
+// webview is given to get typed text into the note.
+window.addEventListener("pagehide", () => {
+  blockView.commit(false);
+  void save();
 });
 window.addEventListener("hashchange", () => {
   if (started) route();
 });
 
-// flush the last edits before the window closes (Cmd+Q, red button)
+// Closing the window: Tauri awaits this handler before destroying it.
 void getCurrentWindow()
   .onCloseRequested(async () => {
     blockView.flush();
@@ -971,11 +1146,28 @@ void getCurrentWindow()
   })
   .catch(() => {});
 
+// Quitting the app (⌘Q) does NOT go through onCloseRequested — it terminates
+// the process, which used to take the save debounce and any open block editor
+// with it. Rust defers the exit and asks us to flush first; it force-quits
+// after two seconds regardless, so a wedged webview can't make the app
+// unquittable.
+void listen("carnet://flush-and-exit", () => {
+  void (async () => {
+    try {
+      blockView.flush();
+      await save();
+    } finally {
+      await backend.confirmExit().catch(() => {});
+    }
+  })();
+}).catch(() => {});
+
 /* ---------- boot ---------- */
 
 async function startApp(): Promise<void> {
   try {
-    paths = await backend.listNotes();
+    lastMeta = await backend.listNotesMeta();
+    setPaths(lastMeta.map((m) => m.path));
   } catch (e) {
     toast(String(e));
     backend.clearVault();

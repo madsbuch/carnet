@@ -13,6 +13,10 @@
 // - `active` is the one live edit session. commit(false) flushes its text but
 //   keeps the session alive while the textarea still has focus (Cmd+S,
 //   app-switch); it only closes on blur/navigation (forceClose) or render.
+// - Typing flushes on its own, on a short debounce (LIVE_COMMIT_MS). Without
+//   that, text typed into a block lived only in the textarea until something
+//   ended the session, so a crash or an OS kill — the normal way an Android app
+//   dies — took everything written since the block was opened.
 // - `staleDom` means the DOM no longer matches the content (a flush happened
 //   without a re-render, mid tap-through); `staleShifted` additionally means
 //   line numbers moved, so handlers holding line coordinates must drop their
@@ -29,7 +33,7 @@ import {
   type TargetType,
 } from "../blocks";
 import { countLabel } from "../counts";
-import { normalizeTasks, taskLinesIn, taskState, toggleTaskAtLine } from "../links";
+import { normalizeTasks, taskLines, taskLinesInRange, taskState, toggleTaskAtLine } from "../links";
 import { insertWikiLink } from "./linkcomplete";
 
 export interface BlockHost {
@@ -75,12 +79,18 @@ const TOOLS: { t: TargetType | "delete" | "link" | "hrule"; label: string; title
   { t: "delete", label: "✕", title: "Delete block" },
 ];
 
+/** How long typing may sit only in the textarea before it reaches the note.
+ *  Short enough that a crash costs a few words, long enough not to splice the
+ *  file on every keystroke. */
+const LIVE_COMMIT_MS = 400;
+
 export class BlockView {
   private active: ActiveEdit | null = null;
   private staleDom = false;
   private staleShifted = false;
   private lineDelta = 0;
   private commitEnd = -1;
+  private liveTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     private container: HTMLElement,
@@ -118,9 +128,34 @@ export class BlockView {
     return this.commit(false, true);
   }
 
+  /**
+   * Push what's in the textarea into the note shortly after typing stops,
+   * without closing the session or re-rendering — the same flush Cmd+S does.
+   * The host then marks the note dirty and schedules its own save, so nothing
+   * ever sits unsaved for longer than this debounce plus the host's.
+   */
+  private scheduleLiveCommit(): void {
+    clearTimeout(this.liveTimer);
+    this.liveTimer = setTimeout(() => {
+      const a = this.active;
+      // Only while the textarea still holds focus: commit(false) ends a session
+      // whose textarea has lost it, and an orphaned editor swallows keystrokes.
+      // If focus did move, blur has already flushed this text anyway.
+      if (a && a.textarea.isConnected && document.activeElement === a.textarea) {
+        this.commit(false);
+      }
+    }, LIVE_COMMIT_MS);
+  }
+
+  private cancelLiveCommit(): void {
+    clearTimeout(this.liveTimer);
+    this.liveTimer = undefined;
+  }
+
   /* ---------- rendering ---------- */
 
   render(): void {
+    this.cancelLiveCommit(); // the session it would have flushed is going away
     this.active = null;
     this.staleDom = false;
     this.staleShifted = false;
@@ -239,20 +274,24 @@ export class BlockView {
       if (mapped) img.src = mapped;
     });
     // checkboxes: block-scoped mapping, only wired when the DOM and the source
-    // agree on both the count AND every box's checked state
+    // agree on both the count AND every box's checked state.
+    // The task-line map is computed once for the note; doing it per block meant
+    // re-splitting and re-fence-masking the whole note for every checkbox block,
+    // which is quadratic — 10 s on a phone for a 4,000-item checklist.
+    const allTaskLines = taskLines(src);
     c.querySelectorAll<HTMLElement>("[data-start]").forEach((el) => {
       const boxes = [...el.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')];
       if (boxes.length === 0) return;
-      const taskLines = taskLinesIn(src, Number(el.dataset.start), Number(el.dataset.end));
-      if (taskLines.length !== boxes.length) return;
-      const agree = boxes.every((box, k) => taskState(srcLines[taskLines[k]]) === box.checked);
+      const blockTasks = taskLinesInRange(allTaskLines, Number(el.dataset.start), Number(el.dataset.end));
+      if (blockTasks.length !== boxes.length) return;
+      const agree = boxes.every((box, k) => taskState(srcLines[blockTasks[k]]) === box.checked);
       if (!agree) return; // unsafe mapping → read-only
       boxes.forEach((box, k) => {
         box.disabled = false;
         box.addEventListener("click", (e) => e.stopPropagation());
         box.addEventListener("change", () => {
           if (this.consumeStale()) return;
-          const next = toggleTaskAtLine(this.host.content(), taskLines[k]);
+          const next = toggleTaskAtLine(this.host.content(), blockTasks[k]);
           if (next !== null) this.host.update(next);
           this.rerenderKeepScroll();
         });
@@ -384,10 +423,16 @@ export class BlockView {
     // fires input (typing, the link button) or lands in sizeTextarea
     const counter = document.createElement("div");
     counter.className = "block-count";
+    // Trails typing rather than tracking it: counting is a whole-text regex
+    // walk, and a block can be as long as the note.
+    let counterTimer: ReturnType<typeof setTimeout> | undefined;
     const syncCounter = (): void => {
-      counter.textContent = countLabel(textarea.value);
+      clearTimeout(counterTimer);
+      counterTimer = setTimeout(() => {
+        counter.textContent = countLabel(textarea.value);
+      }, 200);
     };
-    syncCounter();
+    counter.textContent = countLabel(text);
     for (const tool of TOOLS) {
       const btn = document.createElement("button");
       btn.type = "button";
@@ -424,6 +469,7 @@ export class BlockView {
     textarea.addEventListener("input", () => {
       this.sizeTextarea(textarea);
       syncCounter();
+      this.scheduleLiveCommit();
     });
     textarea.addEventListener("keydown", (e) => this.onEditorKey(e, textarea));
     textarea.addEventListener("blur", () => {
@@ -513,6 +559,7 @@ export class BlockView {
    * an orphaned-but-focused textarea would silently swallow keystrokes.
    */
   commit(renderAfter = true, forceClose = false): boolean {
+    this.cancelLiveCommit();
     const a = this.active;
     if (!a) {
       if (renderAfter && this.staleDom) this.rerenderKeepScroll();
@@ -533,8 +580,8 @@ export class BlockView {
           a.append = false;
           a.end = a.start + newLines.length - 1;
           this.lineDelta = 0;
+          // appended past everything rendered, so no block's coordinates moved
           this.commitEnd = Number.MAX_SAFE_INTEGER;
-          this.staleShifted = true;
           this.host.update(lines.join("\n"));
         }
       } else {
@@ -543,7 +590,12 @@ export class BlockView {
         // cumulative vs the rendered DOM, not vs the previous flush
         this.lineDelta = a.end - a.domEnd;
         this.commitEnd = a.domEnd;
-        this.staleShifted = true;
+        // Only a change in line COUNT invalidates the coordinates other
+        // handlers are holding, and lineDelta is measured against the rendered
+        // DOM rather than the previous flush, so it goes back to false when the
+        // count comes back. This matters now that typing flushes continuously:
+        // otherwise every link and checkbox would go dead while you edit.
+        this.staleShifted = this.lineDelta !== 0;
         this.host.update(lines.join("\n"));
       }
       a.original = value;

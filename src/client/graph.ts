@@ -1,7 +1,19 @@
 // Force-directed graph of the vault, rendered on canvas.
 // Mouse: wheel zoom, drag to pan, drag nodes, click to open.
 // Touch: one finger pans (or drags a node), two fingers pinch-zoom.
+//
+// Scope, not everything. A whole 10,000-note vault is ~50,000 edges: the
+// simulation cost is superlinear in how densely packed the nodes are, and at
+// that size it settles at well under a frame a second on a phone while drawing
+// a hairball nobody can read anyway. So the view starts at the note you are in
+// and walks outwards a link at a time (BFS), stopping at MAX_NODES. "Wider"
+// takes one more step out. A vault small enough to show whole still shows
+// whole — depth grows until it stops adding anything.
 import type { GraphData } from "../graph-data";
+
+/** Past this the layout is a hairball and the frame budget is gone. */
+const MAX_NODES = 400;
+const DEFAULT_DEPTH = 2;
 
 interface SimNode {
   id: string;
@@ -23,6 +35,73 @@ function hue(s: string): number {
   let h = 5381;
   for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
   return Math.abs(h) % 360;
+}
+
+/**
+ * The subgraph within `depth` links of `origin`, breadth-first and capped at
+ * MAX_NODES. A vault that fits under the cap comes back whole, so small vaults
+ * behave exactly as before.
+ *
+ * `truncated` means the cap stopped it; `reachedAll` means there was nothing
+ * further to reach. Either way there is no point offering "Wider".
+ */
+export function scopeAround(
+  full: GraphData,
+  origin: string | null,
+  depth: number,
+): { data: GraphData; truncated: boolean; reachedAll: boolean } {
+  if (full.nodes.length <= MAX_NODES) {
+    return { data: full, truncated: false, reachedAll: true };
+  }
+  const neighbours = new Map<string, string[]>();
+  const add = (a: string, b: string): void => {
+    const list = neighbours.get(a);
+    if (list) list.push(b);
+    else neighbours.set(a, [b]);
+  };
+  for (const e of full.edges) {
+    add(e.source, e.target);
+    add(e.target, e.source);
+  }
+  // No note open (or it has no links): start from the best-connected note, so
+  // the view still opens on something worth looking at.
+  let start = origin;
+  if (start === null || !full.nodes.some((n) => n.id === start)) {
+    let best = "";
+    let bestDeg = -1;
+    for (const n of full.nodes) {
+      const d = neighbours.get(n.id)?.length ?? 0;
+      if (d > bestDeg) {
+        bestDeg = d;
+        best = n.id;
+      }
+    }
+    start = best;
+  }
+  const keep = new Set<string>([start]);
+  let frontier = [start];
+  let truncated = false;
+  for (let step = 0; step < depth && frontier.length > 0 && !truncated; step++) {
+    const next: string[] = [];
+    for (const id of frontier) {
+      for (const other of neighbours.get(id) ?? []) {
+        if (keep.has(other)) continue;
+        if (keep.size >= MAX_NODES) {
+          truncated = true;
+          break;
+        }
+        keep.add(other);
+        next.push(other);
+      }
+      if (truncated) break;
+    }
+    frontier = next;
+  }
+  const data: GraphData = {
+    nodes: full.nodes.filter((n) => keep.has(n.id)),
+    edges: full.edges.filter((e) => keep.has(e.source) && keep.has(e.target)),
+  };
+  return { data, truncated, reachedAll: !truncated && frontier.length === 0 };
 }
 
 export class GraphView {
@@ -50,6 +129,14 @@ export class GraphView {
   private moved = false;
   private pinchDist = 0;
   private lastDpr = 1;
+  /** The whole vault graph; `nodes`/`edges` above hold the visible scope. */
+  private full: GraphData = { nodes: [], edges: [] };
+  private depth = DEFAULT_DEPTH;
+  private label: HTMLElement;
+  private widerBtn: HTMLButtonElement;
+  private narrowerBtn: HTMLButtonElement;
+  /** Frames of quiet before the loop parks itself. */
+  private idle = 0;
 
   constructor(
     private container: HTMLElement,
@@ -58,15 +145,24 @@ export class GraphView {
   ) {
     this.canvas = container.querySelector("canvas")!;
     this.ctx = this.canvas.getContext("2d")!;
+    this.label = container.querySelector<HTMLElement>("#graph-scope-label")!;
+    this.widerBtn = container.querySelector<HTMLButtonElement>("#graph-wider")!;
+    this.narrowerBtn = container.querySelector<HTMLButtonElement>("#graph-narrower")!;
+    this.widerBtn.addEventListener("click", () => this.widen());
+    this.narrowerBtn.addEventListener("click", () => this.narrow());
     container.querySelector("#graph-close")!.addEventListener("click", () => this.onClose());
     window.addEventListener("resize", () => {
-      if (this.visible) this.resize();
+      if (this.visible) {
+        this.resize();
+        this.wake();
+      }
     });
 
     const c = this.canvas;
     c.addEventListener("wheel", (e) => {
       e.preventDefault();
       this.zoomAt(e.offsetX, e.offsetY, Math.exp(-e.deltaY * 0.0015));
+      this.wake();
     }, { passive: false });
 
     c.addEventListener("pointerdown", (e) => {
@@ -79,6 +175,7 @@ export class GraphView {
         this.moved = false;
         const n = this.hit(e.offsetX, e.offsetY);
         this.downNode = n;
+        this.wake();
         if (n) {
           this.dragNode = n;
           n.fx = n.x;
@@ -98,8 +195,10 @@ export class GraphView {
 
     c.addEventListener("pointermove", (e) => {
       if (!this.pointers.has(e.pointerId)) {
+        const was = this.hovered;
         this.hovered = this.hit(e.offsetX, e.offsetY);
         c.style.cursor = this.hovered ? "pointer" : "default";
+        if (was !== this.hovered) this.wake();
         return;
       }
       const prev = this.pointers.get(e.pointerId)!;
@@ -126,6 +225,7 @@ export class GraphView {
         this.ox += dx / 2;
         this.oy += dy / 2;
       }
+      this.wake();
     });
 
     const up = (e: PointerEvent, cancelled = false) => {
@@ -156,14 +256,17 @@ export class GraphView {
 
   show(data: GraphData, currentId: string | null): void {
     this.currentId = currentId;
-    this.build(data);
+    this.full = data;
+    this.depth = DEFAULT_DEPTH;
+    this.byId = new Map(); // positions from a previous scope don't apply
+    // Sized and on screen before scoping: fit() measures the canvas, and a
+    // hidden canvas measures zero.
     this.container.hidden = false;
     this.visible = true;
     this.resize();
-    this.fit();
-    this.alpha = 1;
     cancelAnimationFrame(this.raf);
-    this.loop();
+    this.raf = 0;
+    this.applyScope(); // builds, fits, and starts the loop
   }
 
   hide(): void {
@@ -171,6 +274,35 @@ export class GraphView {
     this.visible = false;
     this.container.hidden = true;
     cancelAnimationFrame(this.raf);
+    this.raf = 0; // otherwise wake() thinks the loop is still running
+  }
+
+  /** Re-scope around the current note at the current depth and relayout. */
+  private applyScope(): void {
+    const { data, truncated, reachedAll } = scopeAround(this.full, this.currentId, this.depth);
+    this.build(data);
+    this.fit();
+    this.alpha = 1;
+    this.wake();
+    const total = this.full.nodes.length;
+    const shown = data.nodes.length;
+    this.label.textContent =
+      shown >= total
+        ? `${total} ${total === 1 ? "note" : "notes"}`
+        : `${shown} of ${total} notes · ${this.depth} link${this.depth === 1 ? "" : "s"} out`;
+    this.widerBtn.disabled = truncated || reachedAll;
+    this.narrowerBtn.disabled = this.depth <= 1;
+  }
+
+  private widen(): void {
+    this.depth++;
+    this.applyScope();
+  }
+
+  private narrow(): void {
+    if (this.depth <= 1) return;
+    this.depth--;
+    this.applyScope();
   }
 
   private build(data: GraphData): void {
@@ -330,11 +462,29 @@ export class GraphView {
     this.alpha *= 0.994;
   }
 
+  /** Repaint now, and keep painting for a moment (a pan or a hover changes the
+   *  picture without the simulation moving). */
+  private wake(): void {
+    this.idle = 2;
+    if (!this.raf && this.visible) this.raf = requestAnimationFrame(this.loop);
+  }
+
   private loop = (): void => {
-    if (!this.visible) return;
+    if (!this.visible) {
+      this.raf = 0;
+      return;
+    }
     if ((devicePixelRatio || 1) !== this.lastDpr) this.resize(); // window moved between screens
-    if (this.alpha > 0.005) this.step();
+    const settling = this.alpha > 0.005;
+    if (settling) this.step();
+    if (!settling && this.idle <= 0) {
+      // Nothing is moving and nothing has been touched: stop. The loop used to
+      // run forever, repainting an identical picture on a phone's battery.
+      this.raf = 0;
+      return;
+    }
     this.draw();
+    if (!settling) this.idle--;
     this.raf = requestAnimationFrame(this.loop);
   };
 
@@ -360,12 +510,24 @@ export class GraphView {
 
     ctx.strokeStyle = dark ? "#8888a0" : "#666680";
     ctx.lineWidth = 1 / s;
-    for (const [from, to] of this.edges) {
-      ctx.globalAlpha = hl ? (from === hl || to === hl ? 0.55 : 0.05) : 0.16;
+    // One batched path per opacity instead of a beginPath+stroke per edge.
+    // Per-edge stroking was ~50,000 draw calls a frame on a large vault; the
+    // scope cap keeps that far smaller now, but batching is free.
+    const strokeBatch = (alpha: number, pick: (from: SimNode, to: SimNode) => boolean): void => {
+      ctx.globalAlpha = alpha;
       ctx.beginPath();
-      ctx.moveTo(from.x, from.y);
-      ctx.lineTo(to.x, to.y);
+      for (const [from, to] of this.edges) {
+        if (!pick(from, to)) continue;
+        ctx.moveTo(from.x, from.y);
+        ctx.lineTo(to.x, to.y);
+      }
       ctx.stroke();
+    };
+    if (hl) {
+      strokeBatch(0.05, (from, to) => from !== hl && to !== hl);
+      strokeBatch(0.55, (from, to) => from === hl || to === hl);
+    } else {
+      strokeBatch(0.16, () => true);
     }
 
     for (const n of this.nodes) {

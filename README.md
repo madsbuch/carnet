@@ -11,8 +11,11 @@ directly. There is no server and no database; Dropbox does all the syncing.
   doesn't resolve creates the file next to the current note. `[projects/carnet]` addresses an
   exact path from the root. Typing `[` in any editor pops a fuzzy type-ahead over your notes;
   picking one completes the link.
-- **Graph** — a force-directed graph of every link between notes, colored by top-level
-  folder. Notes that are linked but don't exist yet show up gray. Click a node to open it.
+- **Graph** — a force-directed graph of the links around the note you're in, colored by
+  top-level folder. Notes that are linked but don't exist yet show up gray. Click a node to
+  open it. A small vault is drawn whole; a large one starts two links out from the current
+  note and **Wider** walks another step, because ten thousand notes at once is neither
+  readable nor drawable.
 - **Daily notes** — `yyyy-MM-dd.md`. Carnet opens today's note on launch (creating it in the
   folder where your daily notes already live) and `t` jumps back to it.
 - **TODOs** — `- [ ]` checkboxes are clickable in the rendered view and write straight back
@@ -28,6 +31,12 @@ directly. There is no server and no database; Dropbox does all the syncing.
   name to create a note.
 - **Sync-aware** — notes re-read when the app regains focus; if a save collides with an edit
   synced from another device you choose which version wins.
+- **Hard to lose writing** — typing reaches the file within a second and never sits unwritten
+  for more than five, even mid-paragraph; the app flushes before it quits, backgrounds, or
+  closes. Files are written whole and fsynced, so a crash or a flat battery leaves either the
+  old note or the new one, never a truncated one. In Dropbox mode a save that can't be
+  uploaded (no signal) is queued and re-sent, and no upload ever overwrites a note it wasn't
+  based on.
 
 The interface is one page: the note, four buttons, a file tree behind the hamburger. Purpose
 lives in file names (`projects/carnet/carnet-tasks.md`), not in menus. A note scrolls half a

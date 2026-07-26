@@ -21,6 +21,9 @@ import {
 export interface Mirror {
   write(rel: string, content: string): Promise<void>;
   remove(rel: string): Promise<void>;
+  /** Current text of a mirrored note, or null if it isn't there. Used to
+   *  re-send a save whose upload failed. */
+  read(rel: string): Promise<string | null>;
 }
 
 /** Durable key/value for cursor and per-file revs (a persisted blob in the app). */
@@ -28,6 +31,8 @@ export interface Store {
   get(key: string): string | null;
   set(key: string, value: string): void;
   remove(key: string): void;
+  /** Every key currently held, for scanning the outbox. */
+  keys(): string[];
 }
 
 export interface SyncHooks {
@@ -42,6 +47,10 @@ export interface SyncHooks {
 
 const CURSOR_KEY = "carnet.dropbox.cursor";
 const REV_PREFIX = "carnet.dropbox.rev.";
+/** Notes saved locally whose upload hasn't succeeded yet. Persisted, because
+ *  the usual reason a push fails is that the phone is offline — and the usual
+ *  thing that happens next is the app being killed. */
+const OUTBOX_PREFIX = "carnet.dropbox.outbox.";
 
 /** How many files to download at once during a large sync. */
 const DOWNLOAD_CONCURRENCY = 6;
@@ -95,6 +104,10 @@ export class CachedStore implements Store {
   remove(key: string): void {
     delete this.data[key];
     this.schedule();
+  }
+
+  keys(): string[] {
+    return Object.keys(this.data);
   }
 
   private schedule(): void {
@@ -192,6 +205,14 @@ export class DropboxSync {
     // A file we already have at this exact rev needs no download — this makes
     // the loop idempotent and ignores the echo of our own uploads.
     if (this.revs.get(d.rel) === d.rev) return;
+    // Never let a pull overwrite an edit that hasn't been uploaded yet: that
+    // local text is the only copy of it. Leaving the rev unrecorded means the
+    // download is retried once the edit is delivered, and drainOutbox will
+    // report the collision in the meantime.
+    if (this.store.get(OUTBOX_PREFIX + d.rel) !== null) {
+      this.hooks.onError(`${d.rel} changed in Dropbox but has unsent local edits`);
+      return;
+    }
     const { content, rev } = await this.client.download(d.rel);
     await this.mirror.write(d.rel, content);
     this.revs.set(d.rel, rev);
@@ -206,6 +227,10 @@ export class DropboxSync {
     let failures = 0;
     while (!this.stopped) {
       try {
+        // Anything a previous save couldn't deliver goes first: it is the only
+        // copy of that edit, and the pull below may overwrite the mirror.
+        await this.drainOutbox();
+        if (this.stopped) break;
         const cursor = this.cursor();
         if (!cursor) {
           await this.initialSync();
@@ -279,19 +304,73 @@ export class DropboxSync {
     baseRev: string | undefined,
   ): Promise<{ status: "ok" } | { status: "conflict"; content: string }> {
     if (!isMarkdown(rel)) throw new Error("only .md notes sync to Dropbox");
+    // Queued up front: if this throws (offline, dead Wi-Fi) the save is still
+    // recorded as owed, and drainOutbox re-sends it when the network is back.
+    this.store.set(OUTBOX_PREFIX + rel, "1");
     try {
       const { rev } = await this.client.upload(rel, content, baseRev || undefined);
       this.revs.set(rel, rev);
+      this.store.remove(OUTBOX_PREFIX + rel);
       return { status: "ok" };
     } catch (e) {
       if (e instanceof WriteConflict) {
         const server = await this.client.download(rel);
         await this.mirror.write(rel, server.content);
         this.revs.set(rel, server.rev);
+        // The caller resolves this one interactively; it is no longer owed.
+        this.store.remove(OUTBOX_PREFIX + rel);
         return { status: "conflict", content: server.content };
       }
       throw e;
     }
+  }
+
+  /** Paths whose upload never landed. */
+  private owed(): string[] {
+    return this.store
+      .keys()
+      .filter((k) => k.startsWith(OUTBOX_PREFIX))
+      .map((k) => k.slice(OUTBOX_PREFIX.length));
+  }
+
+  /**
+   * Re-send saves whose upload failed. Runs on every loop pass, so coming back
+   * into coverage is enough to deliver them. A note that has *also* changed on
+   * Dropbox is left queued and reported rather than resolved silently — the
+   * local text is the only copy of that edit, so nothing here may overwrite it.
+   */
+  async drainOutbox(): Promise<void> {
+    for (const rel of this.owed()) {
+      if (this.stopped) return;
+      const content = await this.mirror.read(rel).catch(() => null);
+      if (content === null) {
+        this.store.remove(OUTBOX_PREFIX + rel); // gone locally; nothing to send
+        continue;
+      }
+      try {
+        const { rev } = await this.client.upload(rel, content, this.revs.get(rel));
+        this.revs.set(rel, rev);
+        this.store.remove(OUTBOX_PREFIX + rel);
+      } catch (e) {
+        if (e instanceof WriteConflict) {
+          this.hooks.onError(`${rel} changed in Dropbox too — open it to resolve`);
+          continue;
+        }
+        return; // still offline: everything else is owed too, try again later
+      }
+    }
+  }
+
+  /** How many saves are still waiting to reach Dropbox. */
+  pendingUploads(): number {
+    return this.owed().length;
+  }
+
+  /** True once a listing has run to completion, i.e. the mirror holds every
+   *  note Dropbox has. The cursor is only stored after a full drain, so its
+   *  presence is exactly that guarantee. */
+  isSynced(): boolean {
+    return this.cursor() !== null;
   }
 }
 
