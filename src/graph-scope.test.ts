@@ -86,12 +86,33 @@ describe("scopeAround", () => {
     expect(scoped.truncated).toBe(false);
   });
 
-  test("an isolated note still shows itself", () => {
+  // Pressing `g` on a note with no links is the DEFAULT launch path: the app
+  // opens today's daily note, and a fresh one has no links in it. Anchoring on
+  // it showed a single dot with Wider greyed out and no way to see anything.
+  test("a note with no links falls back to something worth looking at", () => {
     const g = star(5000);
-    g.nodes.push({ id: "alone.md", title: "alone", group: "" });
-    const { data } = scopeAround(g, "alone.md", 2);
-    expect(data.nodes.map((n) => n.id)).toEqual(["alone.md"]);
-    expect(data.edges).toEqual([]);
+    g.nodes.push({ id: "fresh-daily.md", title: "today", group: "" });
+    const { data } = scopeAround(g, "fresh-daily.md", 2);
+    expect(data.nodes.length).toBeGreaterThan(1);
+    expect(data.nodes.some((n) => n.id === "hub")).toBe(true);
+  });
+
+  test("Wider is only offered when there is actually more to reach", () => {
+    // a large vault whose reachable component is a short chain
+    const nodes = Array.from({ length: 1000 }, (_, i) => ({ id: `n${i}`, title: "", group: "" }));
+    const g: GraphData = {
+      nodes,
+      edges: [
+        { source: "n0", target: "n1" },
+        { source: "n1", target: "n2" },
+      ],
+    };
+    // one step out still has n2 to find
+    expect(scopeAround(g, "n0", 1).reachedAll).toBe(false);
+    // two steps out has the whole component; going wider would add nothing, so
+    // offering it just resets the user's pan and zoom for an identical graph
+    expect(scopeAround(g, "n0", 2).reachedAll).toBe(true);
+    expect(scopeAround(g, "n0", 5).reachedAll).toBe(true);
   });
 
   test("links are followed in both directions", () => {
