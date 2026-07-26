@@ -101,18 +101,34 @@ fn write_atomic(abs: &Path, bytes: &[u8]) -> Result<(), String> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or_else(|| "invalid file name".to_string())?;
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = abs.with_file_name(format!(".{file_name}.{seq}.carnet-tmp"));
+    // The pid is in the name because TMP_SEQ only counts within one process, and
+    // nothing stops a second Carnet (a dev build, a second window) opening the
+    // same vault. create_new then makes a collision fail loudly instead of
+    // truncating the other writer's half-written file and publishing the splice.
+    let pid = std::process::id();
+    let mut tmp = PathBuf::new();
+    let mut file = None;
+    for _ in 0..8 {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        tmp = abs.with_file_name(format!(".{file_name}.{pid}.{seq}.carnet-tmp"));
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(f) => {
+                file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let Some(mut f) = file else {
+        return Err("could not create a temp file to save into".into());
+    };
 
     let write = (|| -> std::io::Result<()> {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()
     })();
+    drop(f);
     if let Err(e) = write {
         let _ = fs::remove_file(&tmp);
         return Err(e.to_string());
@@ -256,6 +272,11 @@ fn write_note_impl(
     base_mtime: Option<u64>,
     base_hash: Option<String>,
 ) -> Result<SaveResult, String> {
+    // Everything above here is supposed to work in "\n", but enforce it rather
+    // than trust it: the Dropbox mirror hands over bytes straight from the
+    // server, CRLF and all, and re-expanding those would write \r\r\n on every
+    // line — visible junk in the note, then uploaded back to every device.
+    let content = normalize_eol(&content);
     if !path.to_lowercase().ends_with(".md") {
         return Err("only .md files can be written".into());
     }
@@ -271,7 +292,12 @@ fn write_note_impl(
         let Ok(text) = std::str::from_utf8(&bytes) else {
             return Err(format!("{path} is not valid UTF-8 — refusing to overwrite it"));
         };
-        crlf = bytes.windows(2).any(|w| w == b"\r\n");
+        // Only a file that is *uniformly* CRLF gets CRLF back. One stray \r\n —
+        // pasted into a code fence, say — used to convert every other line
+        // ending in the file, turning a one-word edit into a whole-file diff.
+        let crlf_count = bytes.windows(2).filter(|w| *w == b"\r\n").count();
+        let lf_count = bytes.iter().filter(|b| **b == b'\n').count();
+        crlf = crlf_count > 0 && crlf_count == lf_count;
         let disk = normalize_eol(text);
         if let Some(hash) = &base_hash {
             if djb2(&disk) != *hash {
@@ -705,6 +731,35 @@ mod tests {
     }
 
     #[test]
+    fn writing_content_that_is_already_crlf_does_not_double_the_carriage_returns() {
+        let t = Tmp::new("crlf-double");
+        t.put("win.md", b"# T\r\n\r\nbody\r\n");
+        // The Dropbox mirror hands over bytes straight from the server, so the
+        // content arriving here can already be CRLF. This used to write \r\r\n.
+        write(&t, "win.md", "# T\r\n\r\nedited\r\n").unwrap();
+        assert_eq!(t.read("win.md"), b"# T\r\n\r\nedited\r\n");
+        assert!(!String::from_utf8(t.read("win.md")).unwrap().contains("\r\r"));
+    }
+
+    #[test]
+    fn one_stray_crlf_does_not_convert_the_whole_file() {
+        let t = Tmp::new("crlf-mixed");
+        // an LF note with a single CRLF pasted into a code fence
+        t.put("api.md", b"# API\n\n```\nGET / HTTP/1.1\r\n```\n\nnotes\n");
+        write(&t, "api.md", "# API v2\n\n```\nGET / HTTP/1.1\n```\n\nnotes\n").unwrap();
+        let out = String::from_utf8(t.read("api.md")).unwrap();
+        assert!(!out.contains("\r\n"), "an LF file must stay LF: {out:?}");
+    }
+
+    #[test]
+    fn a_uniformly_crlf_note_is_still_restored() {
+        let t = Tmp::new("crlf-uniform");
+        t.put("win.md", b"a\r\nb\r\nc\r\n");
+        write(&t, "win.md", "a\nB\nc\n").unwrap();
+        assert_eq!(t.read("win.md"), b"a\r\nB\r\nc\r\n");
+    }
+
+    #[test]
     fn an_lf_note_stays_lf() {
         let t = Tmp::new("lf");
         t.put("unix.md", b"# Title\n\nbody\n");
@@ -891,10 +946,15 @@ pub fn run() {
     // the webview is wedged so the app can always be quit.
     app.run(|handle, event| {
         if let tauri::RunEvent::ExitRequested { api, .. } = event {
-            if !should_defer_quit(&QUITTING) {
-                return;
-            }
+            // Hold every quit back until the webview has confirmed, not just the
+            // first. A deferred quit looks like the app ignoring you, so pressing
+            // ⌘Q again is the natural reaction — and letting the second press
+            // through abandoned the flush the first one started. The watchdog,
+            // not this handler, is what guarantees the app can always be quit.
             api.prevent_exit();
+            if !should_defer_quit(&QUITTING) {
+                return; // already asked; don't re-emit or spawn a second watchdog
+            }
             let _ = tauri::Emitter::emit(handle, "carnet://flush-and-exit", ());
             let watchdog = handle.clone();
             std::thread::spawn(move || {

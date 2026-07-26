@@ -41,12 +41,17 @@ class FakeVault implements VaultSource {
       this.failNextReadAll = false;
       throw new Error("vault unreadable");
     }
+    // Snapshot up front, like the real backend: Rust reads the files and only
+    // then does the promise resolve. Reading them after the gate would make a
+    // "slow" read magically see writes that happened during it, which is
+    // exactly the staleness these tests exist to catch.
+    const snapshot = [...this.files.entries()]
+      .map(([path, f]) => ({ path, content: f.content, mtime: f.mtime }))
+      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
     if (this.gate) {
       await new Promise<void>((resolve) => (this.gate = resolve));
     }
-    return [...this.files.entries()]
-      .map(([path, f]) => ({ path, content: f.content, mtime: f.mtime }))
-      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+    return snapshot;
   }
 }
 
@@ -231,6 +236,63 @@ describe("VaultCache", () => {
     await cache.vaultIndex();
     expect(paused).toBeGreaterThan(0); // the build really did slice
     expect(await cache.backlinks("alpha.md")).toEqual(["beta.md", "index.md"]);
+  });
+
+  // A read started before an invalidation is answering a question about a vault
+  // that no longer exists. Publishing it anyway left the backlinks, the graph
+  // and full-text search wrong for the rest of the session, because the mtime
+  // had already been recorded as seen and refresh() would never look again.
+  test("a read that started before a save cannot publish itself afterwards", async () => {
+    const src = new FakeVault(SEED);
+    const cache = await ready(src);
+    src.gate = () => {};
+    const stale = cache.allNotes();
+
+    src.put("beta.md", "# Beta\nlinks to [alpha]", 999);
+    cache.noteSaved("beta.md", "# Beta\nlinks to [alpha]", 999);
+
+    (src.gate as unknown as () => void)(); // the pre-save read lands now
+    src.gate = null;
+    await stale;
+
+    expect(await cache.backlinks("alpha.md")).toEqual(["beta.md", "index.md"]);
+  });
+
+  test("and a refresh can still notice the edit, rather than thinking it is current", async () => {
+    const src = new FakeVault(SEED);
+    const cache = await ready(src);
+    src.gate = () => {};
+    const stale = cache.allNotes();
+
+    src.put("beta.md", "# Beta\nedited mid-read", 999);
+    cache.noteSaved("beta.md", "# Beta\nedited mid-read", 999);
+
+    (src.gate as unknown as () => void)();
+    src.gate = null;
+    await stale;
+
+    // the save was dropped rather than recorded, so the listing must still
+    // report a difference — that is the only thing that heals the caches
+    expect((await cache.refresh()).changed).toBe(true);
+    const notes = await cache.allNotes();
+    expect(notes.find((n) => n.path === "beta.md")!.content).toContain("edited mid-read");
+  });
+
+  test("a note deleted mid-read does not come back from the stale snapshot", async () => {
+    const src = new FakeVault(SEED);
+    const cache = await ready(src);
+    src.gate = () => {};
+    const stale = cache.allNotes();
+
+    src.remove("alpha.md");
+    cache.adopt(await src.listMeta()); // what refresh does when paths move
+
+    (src.gate as unknown as () => void)();
+    src.gate = null;
+    await stale;
+
+    const notes = await cache.allNotes();
+    expect(notes.some((n) => n.path === "alpha.md")).toBe(false);
   });
 
   test("changing vault empties everything", async () => {

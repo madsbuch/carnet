@@ -58,6 +58,11 @@ export class VaultCache {
   private building: Promise<VaultIndex> | null = null;
   /** Path + mtime of every note as last seen. */
   private meta: NoteMeta[] = [];
+  /** Bumped by every invalidation. A read or a build that started before the
+   *  bump is answering a question about a vault that no longer exists, so its
+   *  result must not be published — it would otherwise overwrite the cleared
+   *  cache with a stale snapshot, after the clearing. */
+  private generation = 0;
 
   constructor(
     private source: VaultSource,
@@ -102,6 +107,7 @@ export class VaultCache {
 
   /** The set of notes changed, so links may resolve differently. */
   invalidate(): void {
+    this.generation++;
     this.notes = null;
     this.inFlight = null;
     this.index = null;
@@ -112,34 +118,45 @@ export class VaultCache {
 
   allNotes(): Promise<CachedNote[]> {
     if (this.notes) return Promise.resolve(this.notes);
+    const gen = this.generation;
     return (this.inFlight ??= this.source.readAll().then(
       (loaded) => {
-        this.notes = loaded;
-        this.inFlight = null;
+        if (gen === this.generation) {
+          this.notes = loaded;
+          this.inFlight = null;
+        }
         return loaded;
       },
       (e: unknown) => {
-        this.inFlight = null; // a failed read must not cache itself forever
+        if (gen === this.generation) this.inFlight = null; // don't cache a failure
         throw e;
       },
     ));
   }
 
-  /** The link structure. Built in slices the first time, so the build doesn't
-   *  land as one freeze; shared, so two callers don't build it twice. */
+  /**
+   * The link structure. Built in slices the first time, so the build doesn't
+   * land as one freeze; shared, so two callers don't build it twice.
+   *
+   * If the vault moved while this was building, the result describes the old
+   * vault: hand it back for this one render but don't keep it, so the next
+   * caller rebuilds. Keeping it was how a single mid-read save could leave the
+   * backlinks and the graph wrong for the rest of the session.
+   */
   vaultIndex(): Promise<VaultIndex> {
     if (this.index) return Promise.resolve(this.index);
+    const gen = this.generation;
     return (this.building ??= this.allNotes()
       .then((notes) => VaultIndex.build(notes, this.pause, this.sliceMs))
       .then((built) => {
-        // A save (or an invalidate) during the build makes it stale on arrival.
-        if (this.building === null) return built;
-        this.index = built;
-        this.building = null;
+        if (gen === this.generation) {
+          this.index = built;
+          this.building = null;
+        }
         return built;
       })
       .catch((e: unknown) => {
-        this.building = null;
+        if (gen === this.generation) this.building = null;
         throw e;
       }));
   }
@@ -155,14 +172,21 @@ export class VaultCache {
    * change from another device.
    */
   noteSaved(path: string, content: string, mtime: number): void {
-    const known = this.meta.find((m) => m.path === path);
-    if (known) known.mtime = mtime;
     if (this.inFlight || this.building) {
       // A read or a build is in flight and may or may not have seen this write.
       // Not worth reconciling: drop it all and let it be rebuilt on demand.
+      //
+      // Deliberately WITHOUT recording the new mtime. Recording it here would
+      // tell refresh() that this note is already accounted for, and refresh()
+      // is the only thing that would ever notice the caches are missing this
+      // edit — so a save landing during a read used to leave the backlinks, the
+      // graph and full-text search wrong for the rest of the session. Leaving
+      // the mtime behind costs one extra listing-triggered re-read instead.
       this.invalidate();
       return;
     }
+    const known = this.meta.find((m) => m.path === path);
+    if (known) known.mtime = mtime;
     if (!this.notes) return;
     const hit = this.notes.find((n) => n.path === path);
     if (hit) {

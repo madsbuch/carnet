@@ -244,16 +244,13 @@ export async function start(hooks: SyncHooks): Promise<DropboxSync> {
     onAuthExpired: hooks.onAuthExpired,
   };
   const sync = new DropboxSync(client, mirror, cache, persisting);
-  // Try to populate the mirror before the caller lists it, but don't let a
-  // failure (e.g. offline) abort startup: the loop retries the initial sync
-  // itself and self-heals instead of leaving a dead, no-sync session.
   engine = sync;
-  try {
-    await sync.initialSync();
-  } catch {
-    /* the loop will retry from scratch (no cursor yet); until it succeeds the
-     * mirror is incomplete and note creation stays disabled */
-  }
+  // The loop does the initial sync itself when there's no cursor, and it is NOT
+  // awaited here. Awaiting it meant the app rendered nothing at all until the
+  // whole vault had downloaded — one HTTP request per note, six at a time, so
+  // minutes of blank screen on a large vault, with the app looking hung. The UI
+  // comes up against whatever the mirror already holds and fills in as notes
+  // arrive; onChanged refreshes it, and isSynced() still gates note creation.
   void sync.run();
   return sync;
 }

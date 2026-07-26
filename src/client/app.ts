@@ -157,6 +157,13 @@ async function doSave(): Promise<void> {
   if (!note || !dirty) return;
   const n = note;
   const contentAtSave = n.content;
+  // The cap restarts from here, not from when the note first went dirty. Left
+  // running from the first edit it went negative after five seconds of
+  // uninterrupted typing and stayed there — `wait` clamped to 0, so every
+  // subsequent keystroke forced a fresh write and Dropbox upload instead of
+  // waiting out the debounce. The cap bounds how long text can sit unwritten;
+  // it isn't meant to replace the debounce.
+  dirtySince = 0;
   // Snapshot the Dropbox base rev BEFORE writing the mirror, so if the pull
   // loop moves the rev between here and the upload, the push conflicts (and
   // prompts) instead of silently overwriting the other device's change.
@@ -211,15 +218,24 @@ async function pushToDropbox(
   try {
     const push = await dropboxSync.pushNote(n.path, contentAtSave, baseRev);
     if (push.status !== "conflict") return;
+    // The local file still holds the user's text at this point — pushNote no
+    // longer touches it — so nothing is lost if this dialog is never answered.
     const keepMine = await ask(
       "This note also changed in Dropbox. Which version should win?",
       { title: "Note changed in Dropbox", okLabel: "Keep mine", cancelLabel: "Load Dropbox version" },
     );
     if (keepMine) {
-      await backend.writeNote(n.path, contentAtSave); // mirror = mine
-      // re-push based on the server rev we just pulled, so this write wins
-      await dropboxSync.pushNote(n.path, contentAtSave, dropboxSync.revOf(n.path));
-    } else if (note === n) {
+      const again = await dropboxSync.resolveConflict(n.path, "mine", contentAtSave);
+      // A third device can change the note while the dialog sits open. Say so
+      // rather than discarding the answer: silently taking theirs after the user
+      // chose "keep mine" inverts the one thing they were asked.
+      if (again.status === "conflict") {
+        toast("It changed in Dropbox again — your version is still here; save to retry", 9000);
+      }
+      return;
+    }
+    await dropboxSync.resolveConflict(n.path, "theirs", push.content);
+    if (note === n) {
       n.content = push.content;
       const fresh = await backend.readNote(n.path).catch(() => null);
       if (fresh) n.mtime = fresh.mtime;
@@ -287,7 +303,11 @@ async function loadNote(path: string): Promise<void> {
       // would put an empty file in its place and then push that over the real
       // note, so wait for the mirror instead.
       if (dropboxSync && !dropbox.isSynced()) {
-        toast("Still fetching your notes from Dropbox — open this one again in a moment", 6000);
+        // Remember it and say so on the page, not just in a toast that expires.
+        // On a first launch this is the note the app opened by itself, so
+        // returning without either would leave a blank screen and no way back.
+        deferredPath = path;
+        showWaitingForSync(path);
         return;
       }
       // baseMtime 0: if the file appears concurrently (Dropbox sync), the
@@ -304,6 +324,7 @@ async function loadNote(path: string): Promise<void> {
       vault.addPath(path, n.mtime);
     }
     note = n;
+    deferredPath = null;
     loadedHash = contentHash(n.content);
     dirty = false;
     editing = false;
@@ -314,6 +335,47 @@ async function loadNote(path: string): Promise<void> {
   } catch (e) {
     toast(String(e));
   }
+}
+
+/** A note we couldn't open because the Dropbox mirror was still filling up. */
+let deferredPath: string | null = null;
+
+/** Stand in for a note that hasn't downloaded yet, instead of a blank page. */
+function showWaitingForSync(path: string): void {
+  $("#note-title").textContent = noteTitle(path);
+  $("#note-title").title = path;
+  editorEl.hidden = true;
+  backlinksEl.hidden = true;
+  miniMap.setVisible(false);
+  previewEl.hidden = false;
+  const p = document.createElement("p");
+  p.className = "block-placeholder";
+  p.id = "sync-progress";
+  p.textContent = syncProgressText();
+  previewEl.replaceChildren(p);
+  countEl.hidden = true;
+}
+
+function syncProgressText(): string {
+  const n = dropboxSync?.fetchedCount() ?? 0;
+  return n === 0
+    ? "Fetching your notes from Dropbox…"
+    : `Fetching your notes from Dropbox — ${n.toLocaleString()} so far. This note will open by itself.`;
+}
+
+/** Keep the placeholder's count moving while a first sync runs. It can take
+ *  minutes on a large vault, and a static message reads as a hung app. */
+function updateSyncProgress(): void {
+  const el = document.getElementById("sync-progress");
+  if (el) el.textContent = syncProgressText();
+}
+
+/** The mirror finished filling up: open whatever we couldn't open before. */
+function retryDeferred(): void {
+  if (deferredPath === null || !dropbox.isSynced()) return;
+  const path = deferredPath;
+  deferredPath = null;
+  void loadNote(path);
 }
 
 async function openGraph(): Promise<void> {
@@ -715,6 +777,8 @@ async function applySafeArea(): Promise<void> {
 // mean two concurrent whole-vault reads racing each other.
 let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 let refreshing = false;
+/** Something asked for a refresh while one was already running. */
+let refreshAgain = false;
 
 function scheduleRefresh(): void {
   clearTimeout(refreshTimer);
@@ -728,7 +792,16 @@ function scheduleRefresh(): void {
  * the caches.
  */
 async function refreshFromDisk(): Promise<void> {
-  if (!started || !backend.vaultRoot() || refreshing) return;
+  if (!started || !backend.vaultRoot()) return;
+  if (refreshing) {
+    // Coalesce, never drop. Listing 10,000 files takes long enough that a
+    // Dropbox delta can easily land mid-walk, and the walk already in progress
+    // will not see it: dropping the request left the note on disk but absent
+    // from the path list, the tree and link resolution — at which point tapping
+    // a link to it created a second copy somewhere else.
+    refreshAgain = true;
+    return;
+  }
   refreshing = true;
   try {
     let moved: boolean;
@@ -753,6 +826,10 @@ async function refreshFromDisk(): Promise<void> {
     }
   } finally {
     refreshing = false;
+    if (refreshAgain) {
+      refreshAgain = false;
+      scheduleRefresh();
+    }
   }
 }
 
@@ -1057,7 +1134,24 @@ void listen("carnet://flush-and-exit", () => {
   void (async () => {
     try {
       blockView.flush();
-      await save();
+      // Straight to disk, ahead of the normal save. save() queues behind
+      // whatever is already in flight, and in Dropbox mode that can be an
+      // upload with no timeout — so the watchdog would force the exit with the
+      // text still only in memory. The upload can wait: pushNote records the
+      // save as owed before it tries, so the outbox re-sends it next launch.
+      if (note && dirty) {
+        const n = note;
+        const content = n.content;
+        const res = await backend
+          .writeNote(n.path, content, n.mtime, loadedHash ?? undefined)
+          .catch(() => null);
+        if (res?.status === "ok") {
+          n.mtime = res.mtime;
+          loadedHash = contentHash(content);
+          dirty = false;
+        }
+      }
+      void save(); // let the Dropbox push start; it will be owed if it can't finish
     } finally {
       await backend.confirmExit().catch(() => {});
     }
@@ -1094,8 +1188,10 @@ async function startDropboxMode(): Promise<void> {
   dropboxSync = await dropbox.start({
     onChanged: () => {
       vault.invalidate();
-      void refreshFromDisk();
+      retryDeferred();
+      scheduleRefresh();
     },
+    onProgress: () => updateSyncProgress(),
     onError: (m) => toast(m),
     onAuthExpired: () => {
       // Loop has already stopped. Drop the handle so saves stay local (no
