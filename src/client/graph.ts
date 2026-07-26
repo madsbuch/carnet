@@ -63,10 +63,19 @@ export function scopeAround(
     add(e.source, e.target);
     add(e.target, e.source);
   }
-  // No note open (or it has no links): start from the best-connected note, so
-  // the view still opens on something worth looking at.
-  let start = origin;
-  if (start === null || !full.nodes.some((n) => n.id === start)) {
+  // No note open, no such note, or a note with no links: start from the
+  // best-connected note, so the view opens on something worth looking at.
+  // The link-less case is the one that matters — the app opens today's daily
+  // note on launch and a fresh one has no links, so anchoring on it drew a
+  // single dot with no way to reach the rest of the vault.
+  const usable =
+    origin !== null &&
+    (neighbours.get(origin)?.length ?? 0) > 0 &&
+    full.nodes.some((n) => n.id === origin);
+  let start: string;
+  if (usable) {
+    start = origin;
+  } else {
     let best = "";
     let bestDeg = -1;
     for (const n of full.nodes) {
@@ -101,7 +110,13 @@ export function scopeAround(
     nodes: full.nodes.filter((n) => keep.has(n.id)),
     edges: full.edges.filter((e) => keep.has(e.source) && keep.has(e.target)),
   };
-  return { data, truncated, reachedAll: !truncated && frontier.length === 0 };
+  // "Nothing further out" means nothing on the frontier has an unvisited
+  // neighbour — not merely that the walk stopped. Reading it off the walk left
+  // Wider enabled when it would add nothing, and pressing it re-fitted and
+  // re-simulated the identical graph, throwing away the user's pan and zoom.
+  const reachedAll =
+    !truncated && !frontier.some((id) => (neighbours.get(id) ?? []).some((o) => !keep.has(o)));
+  return { data, truncated, reachedAll };
 }
 
 export class GraphView {
@@ -137,6 +152,7 @@ export class GraphView {
   private narrowerBtn: HTMLButtonElement;
   /** Frames of quiet before the loop parks itself. */
   private idle = 0;
+  private dprTimer: ReturnType<typeof setInterval> | undefined;
 
   constructor(
     private container: HTMLElement,
@@ -157,6 +173,11 @@ export class GraphView {
         this.wake();
       }
     });
+    // The loop parks itself once the layout settles, which also stops the
+    // per-frame checks it used to carry. Light/dark is read inside draw(), so
+    // without this the canvas kept light-mode node colours and white label
+    // halos on a dark panel until something happened to wake it.
+    this.dark.addEventListener("change", () => this.wake());
 
     const c = this.canvas;
     c.addEventListener("wheel", (e) => {
@@ -266,6 +287,7 @@ export class GraphView {
     this.resize();
     cancelAnimationFrame(this.raf);
     this.raf = 0;
+    this.watchDpr();
     this.applyScope(); // builds, fits, and starts the loop
   }
 
@@ -275,6 +297,8 @@ export class GraphView {
     this.container.hidden = true;
     cancelAnimationFrame(this.raf);
     this.raf = 0; // otherwise wake() thinks the loop is still running
+    clearInterval(this.dprTimer);
+    this.dprTimer = undefined;
   }
 
   /** Re-scope around the current note at the current depth and relayout. */
@@ -467,6 +491,21 @@ export class GraphView {
   private wake(): void {
     this.idle = 2;
     if (!this.raf && this.visible) this.raf = requestAnimationFrame(this.loop);
+  }
+
+  /** Dragging a window to a display of different pixel density changes no CSS
+   *  size, so it fires no resize event — the loop used to catch it by polling
+   *  every frame, which parking removed. A one-second check while the graph is
+   *  open costs nothing next to the 60 fps redraw it replaced. */
+  private watchDpr(): void {
+    clearInterval(this.dprTimer);
+    this.dprTimer = setInterval(() => {
+      if (!this.visible) return;
+      if ((devicePixelRatio || 1) !== this.lastDpr) {
+        this.resize();
+        this.wake();
+      }
+    }, 1000);
   }
 
   private loop = (): void => {

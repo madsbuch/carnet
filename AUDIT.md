@@ -425,6 +425,30 @@ them introduced by the fixes. What follows is the record; all but three are fixe
   turning a one-word edit into a whole-file diff. Only a uniformly-CRLF file is restored
   as CRLF now.
 
+### Graph round
+
+The fifth reviewer reported after the round above. Three findings, all from the graph
+rework, all fixed.
+
+- **The graph was a single dot on the default launch path.** `scopeAround`'s comment said
+  it would fall back to the best-connected note when the current one "has no links", but
+  the guard only checked whether the note existed, never its degree. The app opens today's
+  daily note on launch and a fresh one has no links — so on any vault over 400 notes,
+  pressing `g` drew one dot with Wider greyed out and no way to reach anything.
+  *A test of mine had blessed this*: "an isolated note still shows itself" asserted exactly
+  the buggy output. The comment stated the intent, the code did something else, and the
+  test agreed with the code rather than the intent.
+- **Wider was offered when it would add nothing.** `reachedAll` was read off the shape of
+  the walk (did the last step add anything) rather than off actual reachability, so it
+  stayed enabled whenever the depth limit — not the graph — stopped the walk. Pressing it
+  re-fitted and re-simulated an identical graph, throwing away the pan and zoom the user
+  had just set up to read labels.
+- **A parked loop stopped noticing the theme.** Light/dark is read inside `draw()`, and
+  the loop that used to poll it every frame now parks once the layout settles. Switching
+  to dark mode left light-mode node colours and white label halos on a dark panel until
+  something happened to wake it. There is now a `prefers-color-scheme` listener, and a
+  one-second check for the display-density case, which fires no resize event.
+
 ### Still open
 
 Three need a design decision rather than a fix, so they are deliberately not in this round:
