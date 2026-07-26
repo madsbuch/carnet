@@ -13,6 +13,10 @@
     <svg viewBox="0 0 20 20"><path d="M3 5h14M3 10h14M3 15h14"/></svg>
   </button>
   <div id="title"><span id="note-title">Carnet</span><span id="dirty-dot" hidden>&#9679;</span></div>
+  <!-- Where Dropbox sync stands, in Dropbox mode only. Folder mode leaves this
+       hidden: there the Dropbox client owns syncing and Carnet can't speak for
+       it. Tappable when something needs the user. -->
+  <button id="syncstate" type="button" hidden></button>
   <div id="actions">
     <button id="btn-today" class="icon" title="Today's note (t)" aria-label="Today">
       <svg viewBox="0 0 20 20"><rect x="3" y="4" width="14" height="13" rx="2"/><path d="M3 8h14M7 2v4M13 2v4"/></svg>

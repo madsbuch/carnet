@@ -21,7 +21,13 @@ import {
   randomVerifier,
   type Tokens,
 } from "./dropbox";
-import { CachedStore, DropboxSync, type Mirror, type SyncHooks } from "./dropboxsync";
+import {
+  CachedStore,
+  DropboxSync,
+  type Mirror,
+  type SyncHooks,
+  type SyncStatus,
+} from "./dropboxsync";
 
 const AUTH_FILE = "dropbox.json";
 const SYNC_FILE = "dropbox-sync.json";
@@ -79,6 +85,11 @@ let engine: DropboxSync | null = null;
 
 export function isSynced(): boolean {
   return engine?.isSynced() ?? false;
+}
+
+/** Where sync stands, or null when Dropbox mode isn't running at all. */
+export function status(): SyncStatus | null {
+  return engine?.status() ?? null;
 }
 
 /** Boot step: load persisted credentials, migrating a connection made before

@@ -601,6 +601,79 @@ describe("DropboxSync", () => {
     expect(sync.fetchedCount()).toBe(3);
   });
 
+  // What the header reads off. Dropbox mode is invisible by design, so this is
+  // the only thing that tells the user whether their notes are actually leaving
+  // the phone — it has to be right about "behind" and "dead" in particular.
+  describe("status", () => {
+    test("a fresh engine reports nothing synced and nothing owed", () => {
+      const h = harness(() => json({}));
+      expect(h.sync.status()).toEqual({
+        synced: false,
+        fetched: 0,
+        pending: 0,
+        failing: false,
+        authExpired: false,
+      });
+    });
+
+    test("a save that couldn't be uploaded shows up as owed", async () => {
+      const h = harness((url) => {
+        if (url.endsWith("/upload")) throw new Error("network down");
+        return json({});
+      });
+      await h.mirror.write("a.md", "text");
+      await expect(h.sync.pushNote("a.md", "text", undefined)).rejects.toThrow();
+      expect(h.sync.status().pending).toBe(1);
+      await h.mirror.write("b.md", "more");
+      await expect(h.sync.pushNote("b.md", "more", undefined)).rejects.toThrow();
+      expect(h.sync.status().pending).toBe(2);
+    });
+
+    test("owed drops back to zero once the upload lands", async () => {
+      let online = false;
+      const h = harness((url) => {
+        if (url.endsWith("/upload")) {
+          if (!online) throw new Error("network down");
+          return json({ rev: "r1" });
+        }
+        return json({});
+      });
+      await h.mirror.write("a.md", "text");
+      await expect(h.sync.pushNote("a.md", "text", undefined)).rejects.toThrow();
+      online = true;
+      await h.sync.drainOutbox();
+      expect(h.sync.status().pending).toBe(0);
+    });
+
+    test("a completed listing reports synced, with the count it fetched", async () => {
+      const h = harness((url) => {
+        if (url.endsWith("/list_folder"))
+          return json({
+            entries: [
+              { ".tag": "file", path_display: "/a.md", rev: "r1" },
+              { ".tag": "file", path_display: "/b.md", rev: "r2" },
+            ],
+            cursor: "C1",
+            has_more: false,
+          });
+        return new Response("x", { status: 200, headers: { "Dropbox-API-Result": '{"rev":"r"}' } });
+      });
+      await h.sync.initialSync();
+      expect(h.sync.status().synced).toBe(true);
+      expect(h.sync.status().fetched).toBe(2);
+    });
+
+    test("dead auth is reported and stays reported", async () => {
+      const h = harness(() => new Response("invalid_access_token", { status: 401 }));
+      h.store.set("carnet.dropbox.cursor", "C1");
+      await h.sync.run(); // returns as soon as auth is refused
+      const s = h.sync.status();
+      expect(s.authExpired).toBe(true);
+      // this is the state that used to go silent after one toast
+      expect(h.sync.status().authExpired).toBe(true);
+    });
+  });
+
   test("isSynced only becomes true once a full listing has landed", async () => {
     const h = harness((url) => {
       if (url.endsWith("/list_folder"))

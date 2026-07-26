@@ -194,12 +194,14 @@ async function doSave(): Promise<void> {
       n.mtime = res.mtime;
       if (note === n) loadedHash = contentHash(contentAtSave);
       vault.noteSaved(n.path, contentAtSave, res.mtime);
+      renderSyncState();
     }
     if (note === n && n.content === contentAtSave) {
       dirty = false;
       updateDirty();
     }
     await pushToDropbox(n, contentAtSave, baseRev);
+    renderSyncState();
   } catch (e) {
     toast("Save failed: " + e);
   }
@@ -355,6 +357,58 @@ function showWaitingForSync(path: string): void {
   previewEl.replaceChildren(p);
   countEl.hidden = true;
 }
+
+/* ---------- sync state ----------
+ * Dropbox mode is invisible by design: notes are files and the engine runs in
+ * the background. That's fine until it isn't — and there was nothing on screen
+ * to tell you whether it was connected, behind, or dead. Worst of all, expired
+ * auth showed one toast and then went quiet forever while every save stayed
+ * local. This is the one place that says where things actually stand. */
+
+const syncStateEl = $<HTMLButtonElement>("#syncstate");
+
+function renderSyncState(): void {
+  const s = dropbox.status();
+  if (s === null) {
+    // Folder mode: the Dropbox client owns syncing and Carnet can't speak for it.
+    syncStateEl.hidden = true;
+    return;
+  }
+  syncStateEl.hidden = false;
+  syncStateEl.classList.remove("busy", "behind", "stuck");
+  if (s.authExpired) {
+    syncStateEl.textContent = "Dropbox disconnected — tap to reconnect";
+    syncStateEl.title = "Your notes are still being saved on this phone, but nothing is syncing.";
+    syncStateEl.classList.add("stuck");
+    return;
+  }
+  if (s.pending > 0) {
+    const n = s.pending;
+    syncStateEl.textContent = s.failing
+      ? `Offline · ${n} to upload`
+      : `${n} to upload`;
+    syncStateEl.title = "Saved on this phone, waiting to reach Dropbox. It will re-send by itself.";
+    syncStateEl.classList.add(s.failing ? "stuck" : "behind");
+    return;
+  }
+  if (!s.synced) {
+    syncStateEl.textContent = s.failing
+      ? "Offline — can't reach Dropbox"
+      : `Fetching notes… ${s.fetched.toLocaleString()}`;
+    syncStateEl.title = "Downloading your Dropbox folder.";
+    syncStateEl.classList.add(s.failing ? "stuck" : "busy");
+    return;
+  }
+  syncStateEl.textContent = s.failing ? "Offline" : "Synced";
+  syncStateEl.title = s.failing
+    ? "Everything you've written is uploaded; Carnet just can't reach Dropbox right now."
+    : "Everything is on Dropbox.";
+  if (s.failing) syncStateEl.classList.add("behind");
+}
+
+syncStateEl.addEventListener("click", () => {
+  if (dropbox.status()?.authExpired) void changeVault(); // the reconnect screen
+});
 
 function syncProgressText(): string {
   const n = dropboxSync?.fetchedCount() ?? 0;
@@ -1160,6 +1214,13 @@ void listen("carnet://flush-and-exit", () => {
 
 /* ---------- boot ---------- */
 
+/** The pull loop can sit in an eight-minute longpoll between events, so the
+ *  count is also refreshed on a slow tick. Two reads of in-memory state. */
+function watchSyncState(): void {
+  renderSyncState();
+  setInterval(renderSyncState, 3000);
+}
+
 async function startApp(): Promise<void> {
   // Every route into the app lands here before anything renders, so this is
   // where the vault gets its one asset-protocol grant — images in notes are
@@ -1179,6 +1240,7 @@ async function startApp(): Promise<void> {
     return;
   }
   started = true;
+  watchSyncState();
   route();
 }
 
@@ -1190,14 +1252,20 @@ async function startDropboxMode(): Promise<void> {
       vault.invalidate();
       retryDeferred();
       scheduleRefresh();
+      renderSyncState();
     },
-    onProgress: () => updateSyncProgress(),
+    onProgress: () => {
+      updateSyncProgress();
+      renderSyncState();
+    },
+    onStatus: () => renderSyncState(),
     onError: (m) => toast(m),
     onAuthExpired: () => {
       // Loop has already stopped. Drop the handle so saves stay local (no
       // doomed upload on every keystroke) until the user reconnects.
       toast("Dropbox access expired — reconnect from the folder button to keep syncing", 12_000);
       dropboxSync = null;
+      renderSyncState(); // the toast goes; this stays until it's fixed
     },
   });
 }

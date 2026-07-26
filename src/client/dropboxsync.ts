@@ -41,6 +41,8 @@ export interface SyncHooks {
   /** Notes fetched so far. A first sync of a large vault takes minutes, and
    *  without this the app has nothing to say for the whole of it. */
   onProgress?(fetched: number): void;
+  /** Anything that changes what {@link DropboxSync.status} would report. */
+  onStatus?(): void;
   /** Non-fatal problem worth surfacing (e.g. a toast). */
   onError(message: string): void;
   /** Auth died (token revoked/expired); the loop has stopped and the user must
@@ -156,6 +158,10 @@ export class DropboxSync {
   private serverRevs = new Map<string, string>();
   /** Notes downloaded this session, for progress reporting. */
   private fetched = 0;
+  /** The last network attempt failed (offline, flaky, rate-limited). */
+  private failing = false;
+  /** Auth is dead; the loop has stopped and only the user can fix it. */
+  private authExpired = false;
   private running = false;
   private stopped = false;
   /** aborts the in-flight longpoll so stop() takes effect immediately */
@@ -269,10 +275,13 @@ export class DropboxSync {
           this.hooks.onChanged();
         }
         failures = 0;
+        this.failing = false;
       } catch (e) {
         if (this.stopped) break;
         // Dead auth: stop and hand off to the user, don't retry forever.
         if (e instanceof DropboxAuthError) {
+          this.authExpired = true;
+          this.hooks.onStatus?.();
           if (this.hooks.onAuthExpired) this.hooks.onAuthExpired();
           else this.hooks.onError("Dropbox access expired — reconnect to keep syncing");
           break;
@@ -284,6 +293,8 @@ export class DropboxSync {
           continue;
         }
         failures++;
+        this.failing = true;
+        this.hooks.onStatus?.();
         this.hooks.onError("Dropbox sync: " + (e instanceof Error ? e.message : String(e)));
         // Honor a server-requested Retry-After (429/503); otherwise exponential
         // backoff capped at ~1 min so a blip doesn't hammer the API.
@@ -418,6 +429,31 @@ export class DropboxSync {
   isSynced(): boolean {
     return this.cursor() !== null;
   }
+
+  /** Everything the UI needs to say where sync stands, in one read. */
+  status(): SyncStatus {
+    return {
+      synced: this.isSynced(),
+      fetched: this.fetched,
+      pending: this.owed().length,
+      failing: this.failing,
+      authExpired: this.authExpired,
+    };
+  }
+}
+
+/** A snapshot of where sync stands, for display. */
+export interface SyncStatus {
+  /** A full listing has landed: the mirror holds every note Dropbox has. */
+  synced: boolean;
+  /** Notes pulled down this session. */
+  fetched: number;
+  /** Saves written locally but not yet uploaded. */
+  pending: number;
+  /** The last network attempt failed. */
+  failing: boolean;
+  /** Auth is dead; nothing will sync until the user reconnects. */
+  authExpired: boolean;
 }
 
 /* ---------------- helpers ---------------- */
