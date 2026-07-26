@@ -174,7 +174,11 @@ body.sidebar-open #sidebar { transform: none; }
 #main {
   max-width: 46rem;
   margin: 0 auto;
-  padding: 20px 20px calc(60px + var(--safe-bottom));
+  /* Room to scroll past the end: writing happens at the end of a long note,
+     and the end of the note is otherwise pinned to the bottom of the screen
+     (behind the keyboard, on a phone). Half a screen lets the last line be
+     scrolled up to the middle. */
+  padding: 20px 20px calc(50vh + var(--safe-bottom));
 }
 #editor {
   width: 100%;
@@ -190,7 +194,9 @@ body.sidebar-open #sidebar { transform: none; }
 
 /* ---------- markdown / block editing ---------- */
 .markdown { word-wrap: break-word; }
-#preview { min-height: 55vh; }
+/* Tap-below-the-note-to-append zone. Kept under half a screen so it and the
+   scroll-past-end padding together don't leave a short note scrolling. */
+#preview { min-height: 40vh; }
 .markdown [data-start] { border-radius: 6px; cursor: text; }
 @media (hover: hover) {
   .markdown [data-start]:hover {
@@ -296,6 +302,24 @@ body.sidebar-open #sidebar { transform: none; }
 .markdown table { border-collapse: collapse; display: block; overflow-x: auto; }
 .markdown th, .markdown td { border: 1px solid var(--border); padding: 5px 10px; }
 .markdown th { background: var(--code-bg); }
+
+/* ---------- minimap ---------- */
+/* Sits in the gutter beside the 46rem column, so it only appears once the
+   window is wide enough to have a gutter — never on a phone. */
+#minimap {
+  position: fixed;
+  right: 6px;
+  top: calc(58px + var(--safe-top));
+  bottom: calc(10px + var(--safe-bottom));
+  z-index: 5; /* above the note, below every overlay */
+  width: 58px;
+  cursor: pointer;
+  touch-action: none;
+}
+#minimap canvas { display: block; width: 100%; height: 100%; }
+@media (max-width: 1000px) {
+  #minimap { display: none; }
+}
 
 /* ---------- backlinks ---------- */
 #backlinks { margin-top: 48px; border-top: 1px solid var(--border); padding-top: 10px; }

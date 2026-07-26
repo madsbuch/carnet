@@ -51,6 +51,11 @@
   </section>
 </main>
 
+<!-- Whole-note thumbnail + viewport box, on wide windows only (see style.css).
+     The canvas is wrapped because a replaced element won't stretch between
+     top and bottom on its own — the wrapper is the one with the geometry. -->
+<div id="minimap"><canvas></canvas></div>
+
 <div id="quickopen" hidden>
   <div id="qo-panel">
     <div id="qo-top">

@@ -10,6 +10,7 @@ import type { DropboxSync } from "./dropboxsync";
 import { BlockView } from "./blockview";
 import { GraphView } from "./graph";
 import { setupLinkComplete } from "./linkcomplete";
+import { MiniMap } from "./minimap";
 import { setupWiki } from "./wiki";
 
 const $ = <T extends HTMLElement>(sel: string): T => document.querySelector(sel) as T;
@@ -54,6 +55,10 @@ function safeDecode(s: string): string {
     return s;
   }
 }
+
+// Keeps itself in step with the rendered note; the app only says when the
+// rendered note is on screen at all.
+const miniMap = new MiniMap($<HTMLElement>("#minimap"), previewEl);
 
 const graphView = new GraphView(
   $<HTMLElement>("#graphview"),
@@ -396,6 +401,7 @@ function showEditor(): void {
   editorEl.value = note.content;
   previewEl.hidden = true;
   backlinksEl.hidden = true;
+  miniMap.setVisible(false); // nothing rendered to map
   editorEl.hidden = false;
   $("#ic-edit").hidden = true;
   $("#ic-done").hidden = false;
@@ -407,6 +413,7 @@ function showPreview(saveFirst = true): void {
   editing = false;
   editorEl.hidden = true;
   previewEl.hidden = false;
+  miniMap.setVisible(true);
   $("#ic-edit").hidden = false;
   $("#ic-done").hidden = true;
   renderPreview();
