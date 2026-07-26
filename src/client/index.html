@@ -70,8 +70,16 @@
   </div>
 </div>
 
+<!-- The graph opens on the neighbourhood around the note you're in, not the
+     whole vault: a 10,000-node hairball is both unreadable and unrunnable.
+     "Wider" walks one more link outwards. -->
 <div id="graphview" hidden>
   <canvas id="graph-canvas"></canvas>
+  <div id="graph-scope">
+    <span id="graph-scope-label"></span>
+    <button type="button" id="graph-wider">Wider</button>
+    <button type="button" id="graph-narrower">Narrower</button>
+  </div>
   <button id="graph-close" class="icon" title="Close (esc)" aria-label="Close graph">
     <svg viewBox="0 0 20 20"><path d="M5 5l10 10M15 5L5 15"/></svg>
   </button>

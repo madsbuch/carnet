@@ -1,6 +1,8 @@
 use serde::Serialize;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 
 const IGNORED: &[&str] = &["node_modules", ".git", ".obsidian", ".dropbox.cache"];
@@ -12,7 +14,16 @@ pub struct Note {
     mtime: u64,
 }
 
+/// Path + mtime only. The client keeps note bodies cached and re-reads just the
+/// ones whose mtime moved, so regaining focus over a 10k-note vault costs one
+/// walk instead of re-shipping every byte.
 #[derive(Serialize)]
+pub struct NoteMeta {
+    path: String,
+    mtime: u64,
+}
+
+#[derive(Serialize, Debug)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum SaveResult {
     Ok { mtime: u64 },
@@ -43,19 +54,110 @@ fn mtime_ms(p: &Path) -> Result<u64, String> {
 
 /// Read a file as text; invalid UTF-8 becomes replacement characters instead
 /// of an error, so the same note behaves identically in open/search/graph.
+///
+/// Reading lossily is safe. *Writing* what was read lossily is not — the
+/// replacement characters would replace the original bytes for good — so
+/// `write_note` refuses any file that fails `is_valid_utf8`.
 fn read_text(p: &Path) -> Result<String, String> {
     let bytes = fs::read(p).map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(normalize_eol(&String::from_utf8_lossy(&bytes)))
+}
+
+fn is_valid_utf8(p: &Path) -> Result<bool, String> {
+    let bytes = fs::read(p).map_err(|e| e.to_string())?;
+    Ok(std::str::from_utf8(&bytes).is_ok())
+}
+
+/// Everything above the filesystem works in "\n". A file that uses CRLF keeps
+/// it: the content is normalized on the way in and restored on the way out, so
+/// editing one block can't leave a note with mixed endings.
+fn normalize_eol(s: &str) -> String {
+    if s.contains('\r') {
+        s.replace("\r\n", "\n")
+    } else {
+        s.to_string()
+    }
+}
+
+fn file_uses_crlf(p: &Path) -> bool {
+    fs::read(p)
+        .map(|b| b.windows(2).any(|w| w == b"\r\n"))
+        .unwrap_or(false)
 }
 
 /// djb2-xor over UTF-8 bytes, hex-encoded — MUST stay identical to
-/// contentHash() in src/links.ts.
+/// contentHash() in src/links.ts. 64-bit: this is the authoritative
+/// "did the file change under us" check, and a collision means silently
+/// overwriting the other device's edit.
 fn djb2(s: &str) -> String {
-    let mut h: u32 = 5381;
+    let mut h: u64 = 5381;
     for b in s.bytes() {
-        h = h.wrapping_mul(33) ^ (b as u32);
+        h = h.wrapping_mul(33) ^ (b as u64);
     }
-    format!("{h:08x}")
+    format!("{h:016x}")
+}
+
+/// Monotonic suffix for temp files, so two writers on the same note never share
+/// a temp path (a user save and a Dropbox mirror write can land together —
+/// user saves are serialized in the client, mirror writes are not).
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Replace `abs`'s contents atomically *and durably*: write a private temp file,
+/// fsync it so the bytes are on the device before anything points at them,
+/// rename over the target, then fsync the directory so the rename itself
+/// survives. Without the first fsync a power cut can leave the rename durable
+/// and the data not — a 0-byte note where a real one was.
+fn write_atomic(abs: &Path, bytes: &[u8]) -> Result<(), String> {
+    let file_name = abs
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| "invalid file name".to_string())?;
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = abs.with_file_name(format!(".{file_name}.{seq}.carnet-tmp"));
+
+    let write = (|| -> std::io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    })();
+    if let Err(e) = write {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    if let Err(e) = fs::rename(&tmp, abs) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.to_string());
+    }
+    // Best effort: some filesystems (and Android's shared-storage shim) don't
+    // allow opening a directory. The data fsync above is the load-bearing one.
+    if let Some(dir) = abs.parent() {
+        let _ = File::open(dir).and_then(|d| d.sync_all());
+    }
+    Ok(())
+}
+
+/// A temp file this old can only be debris from a crash mid-write: a live one
+/// exists for milliseconds. Sweeping them keeps a crash from leaving litter in
+/// the user's Dropbox folder forever.
+const TMP_STALE_MS: u64 = 5 * 60 * 1000;
+
+fn sweep_stale_tmp(e: &fs::DirEntry, name: &str) {
+    if !name.ends_with(".carnet-tmp") {
+        return;
+    }
+    let path = e.path();
+    let Ok(age) = mtime_ms(&path) else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if now.saturating_sub(age) > TMP_STALE_MS {
+        let _ = fs::remove_file(&path);
+    }
 }
 
 fn walk(dir: &Path, rel: String, out: &mut Vec<String>) {
@@ -63,6 +165,7 @@ fn walk(dir: &Path, rel: String, out: &mut Vec<String>) {
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         if name.starts_with('.') || IGNORED.contains(&name.as_str()) {
+            sweep_stale_tmp(&e, &name);
             continue;
         }
         // never follow symlinks: they can cycle or wander outside the vault
@@ -112,6 +215,19 @@ async fn read_note(root: String, path: String) -> Result<Option<Note>, String> {
     Ok(Some(Note { path, content, mtime }))
 }
 
+/// Path + mtime for every note. Cheap enough to run on every window focus:
+/// the client diffs it against what it has cached and re-reads only the notes
+/// that actually moved, instead of shipping the whole vault again.
+#[tauri::command]
+async fn list_notes_meta(root: String) -> Result<Vec<NoteMeta>, String> {
+    let mut out = Vec::new();
+    for p in list_notes_impl(&root)? {
+        let abs = safe_join(&root, &p)?;
+        out.push(NoteMeta { path: p, mtime: mtime_ms(&abs).unwrap_or(0) });
+    }
+    Ok(out)
+}
+
 /// One IPC round trip for everything — the client builds the link graph and
 /// runs full-text search from this.
 #[tauri::command]
@@ -141,11 +257,29 @@ async fn write_note(
     base_mtime: Option<u64>,
     base_hash: Option<String>,
 ) -> Result<SaveResult, String> {
+    write_note_impl(&root, &path, content, base_mtime, base_hash)
+}
+
+fn write_note_impl(
+    root: &str,
+    path: &str,
+    content: String,
+    base_mtime: Option<u64>,
+    base_hash: Option<String>,
+) -> Result<SaveResult, String> {
     if !path.to_lowercase().ends_with(".md") {
         return Err("only .md files can be written".into());
     }
-    let abs = safe_join(&root, &path)?;
+    let abs = safe_join(root, path)?;
+    let mut crlf = false;
     if abs.is_file() {
+        // The client only ever holds a lossy decode of a non-UTF-8 file, so
+        // writing it back would swap the original bytes for U+FFFD, for good.
+        // Refuse instead: the note stays readable, just not editable.
+        if !is_valid_utf8(&abs)? {
+            return Err(format!("{path} is not valid UTF-8 — refusing to overwrite it"));
+        }
+        crlf = file_uses_crlf(&abs);
         if let Some(hash) = &base_hash {
             let disk = read_text(&abs)?;
             if djb2(&disk) != *hash {
@@ -163,18 +297,8 @@ async fn write_note(
     if let Some(parent) = abs.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    // write-then-rename so a crash or a mid-write Dropbox sync never sees a
-    // truncated file (rename within one directory is atomic)
-    let file_name = abs
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .ok_or_else(|| "invalid file name".to_string())?;
-    let tmp = abs.with_file_name(format!(".{file_name}.carnet-tmp"));
-    fs::write(&tmp, &content).map_err(|e| e.to_string())?;
-    if let Err(e) = fs::rename(&tmp, &abs) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e.to_string());
-    }
+    let out = if crlf { content.replace('\n', "\r\n") } else { content };
+    write_atomic(&abs, out.as_bytes())?;
     Ok(SaveResult::Ok { mtime: mtime_ms(&abs)? })
 }
 
@@ -252,7 +376,10 @@ async fn write_state(
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    fs::write(&path, content).map_err(|e| e.to_string())
+    // Atomic + durable, same as notes: this blob holds the vault path, the
+    // Dropbox tokens and the whole rev map. A torn write loses the revs, and a
+    // lost rev is what turns the next save into a blind overwrite.
+    write_atomic(&path, content.as_bytes())
 }
 
 /// Android glue for the "All files access" permission the vault needs.
@@ -495,14 +622,207 @@ async fn find_vault_candidates() -> Vec<String> {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A scratch dir that cleans itself up.
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(name: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("carnet-test-{name}"));
+            let _ = fs::remove_dir_all(&p);
+            fs::create_dir_all(&p).unwrap();
+            Tmp(p)
+        }
+        fn root(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+        fn read(&self, rel: &str) -> Vec<u8> {
+            fs::read(self.0.join(rel)).unwrap()
+        }
+        fn put(&self, rel: &str, bytes: &[u8]) {
+            fs::write(self.0.join(rel), bytes).unwrap();
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write(t: &Tmp, rel: &str, content: &str) -> Result<SaveResult, String> {
+        write_note_impl(t.root(), rel, content.into(), None, None)
+    }
+
+    // These vectors must match contentHash() in src/links.ts — the two are
+    // compared across the IPC boundary and a mismatch means every save looks
+    // like a conflict. src/links.test.ts asserts the same values.
+    #[test]
+    fn hash_vectors_match_the_client() {
+        assert_eq!(djb2(""), "0000000000001505");
+        assert_eq!(djb2("a"), "000000000002b5c4");
+        assert_eq!(djb2("hello"), "000000310a9cede7");
+        assert_eq!(djb2("# Note\n\nbody\n"), "d06b5d85825c414c");
+        assert_eq!(djb2("Grüße 👋"), "b3bfb38026e3c3c3");
+        assert_eq!(djb2("x").len(), 16, "64-bit, not 32");
+    }
+
+    #[test]
+    fn refuses_to_overwrite_a_file_that_is_not_utf8() {
+        let t = Tmp::new("utf8");
+        // "# T" then two bytes that are not valid UTF-8
+        t.put("bad.md", &[0x23, 0x20, 0x54, 0xff, 0xfe, 0x0a]);
+        let before = t.read("bad.md");
+        let err = write(&t, "bad.md", "# T\u{fffd}\u{fffd}\n").unwrap_err();
+        assert!(err.contains("not valid UTF-8"), "{err}");
+        assert_eq!(t.read("bad.md"), before, "the original bytes must survive");
+    }
+
+    #[test]
+    fn a_crlf_note_stays_crlf_and_never_goes_mixed() {
+        let t = Tmp::new("crlf");
+        t.put("win.md", b"# Title\r\n\r\nfirst\r\n\r\nsecond\r\n");
+        // the client always works in "\n" — it never sees the \r at all
+        let read = read_text(&t.0.join("win.md")).unwrap();
+        assert_eq!(read, "# Title\n\nfirst\n\nsecond\n");
+        // edit one block, exactly as BlockView's splice would
+        write(&t, "win.md", "# Title\n\nEDITED\n\nsecond\n").unwrap();
+        let bytes = t.read("win.md");
+        assert_eq!(bytes, b"# Title\r\n\r\nEDITED\r\n\r\nsecond\r\n");
+        assert!(
+            !String::from_utf8(bytes).unwrap().contains("\n\n\r"),
+            "must not end up with mixed endings"
+        );
+    }
+
+    #[test]
+    fn an_lf_note_stays_lf() {
+        let t = Tmp::new("lf");
+        t.put("unix.md", b"# Title\n\nbody\n");
+        write(&t, "unix.md", "# Title\n\nedited\n").unwrap();
+        assert_eq!(t.read("unix.md"), b"# Title\n\nedited\n");
+    }
+
+    #[test]
+    fn writes_leave_no_temp_file_behind() {
+        let t = Tmp::new("tmp");
+        write(&t, "a.md", "hello").unwrap();
+        let leftovers: Vec<_> = fs::read_dir(&t.0)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("carnet-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+        assert_eq!(t.read("a.md"), b"hello");
+    }
+
+    #[test]
+    fn concurrent_writes_to_one_note_do_not_share_a_temp_path() {
+        let t = Tmp::new("race");
+        let root = t.root().to_string();
+        // A user save and a Dropbox mirror write can land on the same note at
+        // the same time; with a shared temp name they spliced each other.
+        let hands: Vec<_> = (0..8)
+            .map(|i| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let body = format!("{}", "x".repeat(2000 + i));
+                    write_note_impl(&root, "hot.md", body.clone(), None, None).unwrap();
+                    body
+                })
+            })
+            .collect();
+        let bodies: Vec<String> = hands.into_iter().map(|h| h.join().unwrap()).collect();
+        let final_body = String::from_utf8(t.read("hot.md")).unwrap();
+        // whichever won, the file must be exactly one writer's bytes — never a splice
+        assert!(bodies.contains(&final_body), "torn write: len {}", final_body.len());
+    }
+
+    #[test]
+    fn the_hash_guard_reports_a_conflict_instead_of_overwriting() {
+        let t = Tmp::new("conflict");
+        t.put("n.md", b"on disk\n");
+        let stale = djb2("what the client loaded\n");
+        let res = write_note_impl(t.root(), "n.md", "mine\n".into(), None, Some(stale)).unwrap();
+        match res {
+            SaveResult::Conflict { content, .. } => assert_eq!(content, "on disk\n"),
+            SaveResult::Ok { .. } => panic!("silently overwrote a changed file"),
+        }
+        assert_eq!(t.read("n.md"), b"on disk\n");
+        // and the matching hash goes through
+        let good = djb2("on disk\n");
+        let res = write_note_impl(t.root(), "n.md", "mine\n".into(), None, Some(good)).unwrap();
+        assert!(matches!(res, SaveResult::Ok { .. }));
+        assert_eq!(t.read("n.md"), b"mine\n");
+    }
+
+    #[test]
+    fn stale_temp_files_are_swept_but_fresh_ones_are_left_alone() {
+        let t = Tmp::new("sweep");
+        t.put(".old.md.7.carnet-tmp", b"crash debris");
+        t.put(".new.md.8.carnet-tmp", b"in flight");
+        let old = t.0.join(".old.md.7.carnet-tmp");
+        let long_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(TMP_STALE_MS / 1000 + 60);
+        filetime_set(&old, long_ago);
+        t.put("real.md", b"note");
+        let notes = list_notes_impl(t.root()).unwrap();
+        assert_eq!(notes, vec!["real.md".to_string()], "temp files are never listed");
+        assert!(!old.exists(), "stale debris should be swept");
+        assert!(t.0.join(".new.md.8.carnet-tmp").exists(), "a live write must survive");
+    }
+
+    fn filetime_set(p: &Path, when: std::time::SystemTime) {
+        // no external crate: reopen and rewrite with utimensat via libc-free path
+        let secs = when.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let out = std::process::Command::new("touch")
+            .arg("-d")
+            .arg(format!("@{secs}"))
+            .arg(p)
+            .status();
+        assert!(out.map(|s| s.success()).unwrap_or(false), "touch failed");
+    }
+
+    #[test]
+    fn safe_join_rejects_anything_that_escapes_the_vault() {
+        for bad in ["../etc/passwd", "/etc/passwd", "a/../../b", "..", "a/../.."] {
+            assert!(safe_join("/vault", bad).is_err(), "{bad} should be rejected");
+        }
+        assert!(safe_join("/vault", "ok/note.md").is_ok());
+        assert!(safe_join("/vault", "./x.md").is_ok());
+    }
+
+    #[test]
+    fn only_md_files_can_be_written() {
+        let t = Tmp::new("ext");
+        assert!(write(&t, "notes.txt", "x").is_err());
+        assert!(write(&t, "a.md", "x").is_ok());
+    }
+}
+
+/// The webview says "I've flushed, you can go now". See the ExitRequested
+/// handler below.
+#[tauri::command]
+async fn confirm_exit(app: tauri::AppHandle) {
+    app.cleanup_before_exit();
+    std::process::exit(0);
+}
+
+/// Set once the quit has already been deferred, so the second pass (and the
+/// watchdog's own exit) isn't deferred again.
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             vault_exists,
             list_notes,
+            list_notes_meta,
             read_note,
             read_all_notes,
             write_note,
@@ -513,8 +833,31 @@ pub fn run() {
             safe_area_insets,
             storage_ready,
             request_storage_access,
-            find_vault_candidates
+            find_vault_candidates,
+            confirm_exit
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running carnet");
+
+    // Closing the window routes through onCloseRequested in the webview, which
+    // Tauri awaits — but Cmd+Q doesn't: it terminates the app outright, taking
+    // the 800 ms save debounce and any open block editor with it. Defer the
+    // quit once, let the webview flush, and let a watchdog force it through if
+    // the webview is wedged so the app can always be quit.
+    app.run(|handle, event| {
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            use std::sync::atomic::Ordering;
+            if QUITTING.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            api.prevent_exit();
+            let _ = tauri::Emitter::emit(handle, "carnet://flush-and-exit", ());
+            let watchdog = handle.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(2000));
+                watchdog.cleanup_before_exit();
+                std::process::exit(0);
+            });
+        }
+    });
 }

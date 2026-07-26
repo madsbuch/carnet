@@ -68,7 +68,18 @@ const mirror: Mirror = {
     await backend.writeNote(rel, content);
   },
   remove: (rel) => backend.deleteNote(rel),
+  read: async (rel) => (await backend.readNote(rel))?.content ?? null,
 };
+
+/** The running engine, so callers can ask whether the mirror is complete.
+ *  Until it is, a note that simply hasn't downloaded yet is indistinguishable
+ *  from one that doesn't exist, and creating it would later push an empty file
+ *  over the real one. */
+let engine: DropboxSync | null = null;
+
+export function isSynced(): boolean {
+  return engine?.isSynced() ?? false;
+}
 
 /** Boot step: load persisted credentials, migrating a connection made before
  *  they moved out of localStorage. Must run before {@link isConnected}. */
@@ -188,6 +199,7 @@ function badGrantHelp(e: unknown): Error {
 
 export async function disconnect(): Promise<void> {
   auth = {};
+  engine = null;
   await backend.writeState(AUTH_FILE, null).catch(() => {});
   await cache.clear();
   for (const k of Object.keys(localStorage)) {
@@ -235,10 +247,12 @@ export async function start(hooks: SyncHooks): Promise<DropboxSync> {
   // Try to populate the mirror before the caller lists it, but don't let a
   // failure (e.g. offline) abort startup: the loop retries the initial sync
   // itself and self-heals instead of leaving a dead, no-sync session.
+  engine = sync;
   try {
     await sync.initialSync();
   } catch {
-    /* the loop will retry from scratch (no cursor yet) */
+    /* the loop will retry from scratch (no cursor yet); until it succeeds the
+     * mirror is incomplete and note creation stays disabled */
   }
   void sync.run();
   return sync;

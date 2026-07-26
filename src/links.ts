@@ -133,27 +133,64 @@ export function fuzzyScore(query: string, path: string): number {
 }
 
 /**
+ * Link resolution over a prebuilt index. Resolving used to scan every path in
+ * the vault per link, which made the graph O(links x notes) — 80 seconds at
+ * 10,000 notes. Building this once costs one pass; each lookup is then a Map
+ * hit.
+ */
+export interface LinkIndex {
+  /** @see resolveLink */
+  resolve(name: string, fromPath: string): string | null;
+  /** Does this link point at a note that exists? */
+  has(name: string, fromPath: string): boolean;
+}
+
+export function buildLinkIndex(allPaths: string[]): LinkIndex {
+  // lowercased full path -> path, for [dir/name] links
+  const byPath = new Map<string, string>();
+  // lowercased basename -> paths that share it, for bare [name] links
+  const byName = new Map<string, string[]>();
+  for (const p of allPaths) {
+    const lower = p.toLowerCase();
+    if (!byPath.has(lower)) byPath.set(lower, p);
+    const name = basename(lower);
+    const same = byName.get(name);
+    if (same) same.push(p);
+    else byName.set(name, [p]);
+  }
+  // Shallowest then alphabetical, done once per bucket instead of per lookup.
+  // The remaining preference — same folder as the linking note — is the only
+  // part that varies by caller, and buckets are almost always one entry long.
+  for (const same of byName.values()) {
+    if (same.length > 1) {
+      same.sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b));
+    }
+  }
+  const resolve = (name: string, fromPath: string): string | null => {
+    const lower = name.toLowerCase();
+    if (lower.includes("/")) {
+      return byPath.get(normalizePath(lower.endsWith(".md") ? lower : lower + ".md")) ?? null;
+    }
+    const same = byName.get(lower + ".md");
+    if (!same) return null;
+    if (same.length === 1) return same[0];
+    const fromDir = dirOf(fromPath);
+    return same.find((p) => dirOf(p) === fromDir) ?? same[0];
+  };
+  return { resolve, has: (name, fromPath) => resolve(name, fromPath) !== null };
+}
+
+/**
  * Resolve a wiki link name to a vault path.
  * [name] matches name.md anywhere in the vault (case-insensitive); when several
  * match, prefer the one in the same folder as the linking note, then the
  * shallowest, then alphabetical. [dir/name] matches that exact relative path.
+ *
+ * One-shot convenience: it builds an index for a single lookup, so anything
+ * resolving more than a couple of links should hold a {@link LinkIndex}.
  */
 export function resolveLink(name: string, fromPath: string, allPaths: string[]): string | null {
-  const lower = name.toLowerCase();
-  if (lower.includes("/")) {
-    const target = normalizePath(lower.endsWith(".md") ? lower : lower + ".md");
-    return allPaths.find((p) => p.toLowerCase() === target) ?? null;
-  }
-  const candidates = allPaths.filter((p) => basename(p).toLowerCase() === lower + ".md");
-  if (candidates.length === 0) return null;
-  const fromDir = dirOf(fromPath);
-  candidates.sort(
-    (a, b) =>
-      (dirOf(a) === fromDir ? 0 : 1) - (dirOf(b) === fromDir ? 0 : 1) ||
-      a.split("/").length - b.split("/").length ||
-      a.localeCompare(b),
-  );
-  return candidates[0];
+  return buildLinkIndex(allPaths).resolve(name, fromPath);
 }
 
 // Mirrors marked's GFM task detection exactly — checkbox N in the rendered
@@ -197,15 +234,45 @@ export function normalizeTasks(src: string): string {
     .join("\n");
 }
 
-/** Absolute 0-based line numbers of task lines within [start..end], in order. */
-export function taskLinesIn(src: string, start: number, end: number): number[] {
+/**
+ * Absolute 0-based line numbers of every task line in the note, ascending.
+ * Computed once per render: the per-block form below used to re-split and
+ * re-mask the whole note for each block that held a checkbox, which is
+ * quadratic in a long checklist (10 s on a phone for 4,000 items).
+ */
+export function taskLines(src: string): number[] {
   const lines = src.split("\n");
   const mask = proseLineMask(lines);
   const out: number[] = [];
-  for (let i = Math.max(start, 0); i <= Math.min(end, lines.length - 1); i++) {
+  for (let i = 0; i < lines.length; i++) {
     if (mask[i] && TASK_RE.test(lines[i])) out.push(i);
   }
   return out;
+}
+
+/** The slice of a {@link taskLines} map that falls within [start..end]. */
+export function taskLinesInRange(all: number[], start: number, end: number): number[] {
+  const from = lowerBound(all, Math.max(start, 0));
+  const out: number[] = [];
+  for (let i = from; i < all.length && all[i] <= end; i++) out.push(all[i]);
+  return out;
+}
+
+/** First index whose value is >= target, in an ascending array. */
+function lowerBound(sorted: number[], target: number): number {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (sorted[mid] < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/** Absolute 0-based line numbers of task lines within [start..end], in order. */
+export function taskLinesIn(src: string, start: number, end: number): number[] {
+  return taskLinesInRange(taskLines(src), start, end);
 }
 
 /** Flip the task checkbox on a specific line. Returns the new source, or null. */
@@ -224,12 +291,23 @@ export function toggleTaskAtLine(src: string, line: number): string | null {
 /**
  * djb2-xor over UTF-8 bytes, hex-encoded. Used to detect on-disk changes
  * regardless of mtime games — MUST stay identical to djb2() in
- * src-tauri/src/lib.rs.
+ * src-tauri/src/lib.rs (both files carry the same test vectors).
+ *
+ * 64-bit, kept as two 32-bit halves because JS has no u64 and BigInt is far
+ * too slow over a whole note. Width matters here: this is the authoritative
+ * "did the file change under us" check, and a collision means silently
+ * overwriting the other device's edit.
  */
 export function contentHash(s: string): string {
-  let h = 5381 >>> 0;
-  for (const b of new TextEncoder().encode(s)) h = (Math.imul(h, 33) ^ b) >>> 0;
-  return h.toString(16).padStart(8, "0");
+  let hi = 0;
+  let lo = 5381;
+  for (const b of new TextEncoder().encode(s)) {
+    // h *= 33, carrying from the low half into the high half
+    const scaled = lo * 33; // < 2^37, still exact as a double
+    hi = (hi * 33 + Math.floor(scaled / 4294967296)) >>> 0;
+    lo = ((scaled >>> 0) ^ b) >>> 0;
+  }
+  return hi.toString(16).padStart(8, "0") + lo.toString(16).padStart(8, "0");
 }
 
 export function todayName(d = new Date()): string {

@@ -1,6 +1,15 @@
 // Pure vault-level logic: link graph, search, daily notes.
 // Works on plain {path, content} objects — no filesystem, no DOM.
-import { DAILY_RE, basename, dirOf, extractLinks, noteTitle, resolveLink, todayName, topFolder } from "./links";
+import {
+  DAILY_RE,
+  basename,
+  buildLinkIndex,
+  dirOf,
+  extractLinks,
+  noteTitle,
+  todayName,
+  topFolder,
+} from "./links";
 
 export interface NoteDoc {
   path: string;
@@ -28,12 +37,13 @@ export interface GraphData {
 export function buildGraph(notes: NoteDoc[]): GraphData {
   const paths = notes.map((n) => n.path);
   const nodes: GraphNode[] = paths.map((p) => ({ id: p, title: noteTitle(p), group: topFolder(p) }));
+  const index = buildLinkIndex(paths);
   const missing = new Map<string, string>();
   const edgeKeys = new Set<string>();
   const edges: GraphEdge[] = [];
   for (const note of notes) {
     for (const name of extractLinks(note.content)) {
-      let target = resolveLink(name, note.path, paths);
+      let target = index.resolve(name, note.path);
       if (!target) {
         target = "missing:" + name.toLowerCase();
         missing.set(target, name);

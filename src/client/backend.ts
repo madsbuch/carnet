@@ -10,6 +10,12 @@ export interface Note {
   mtime: number;
 }
 
+/** Just enough to tell whether a note changed, without shipping its text. */
+export interface NoteMeta {
+  path: string;
+  mtime: number;
+}
+
 export type SaveResult =
   | { status: "ok"; mtime: number }
   | { status: "conflict"; content: string; mtime: number };
@@ -90,6 +96,12 @@ export const listNotes = () => invoke<string[]>("list_notes", { root: must() });
 export const readNote = (path: string) => invoke<Note | null>("read_note", { root: must(), path });
 
 export const readAllNotes = () => invoke<Note[]>("read_all_notes", { root: must() });
+
+/** Path + mtime for every note — cheap enough to run on every window focus. */
+export const listNotesMeta = () => invoke<NoteMeta[]>("list_notes_meta", { root: must() });
+
+/** Tell Rust the webview has flushed and the app may exit (see ⌘Q handling). */
+export const confirmExit = () => invoke<void>("confirm_exit");
 
 export const writeNote = (path: string, content: string, baseMtime?: number, baseHash?: string) =>
   invoke<SaveResult>("write_note", {

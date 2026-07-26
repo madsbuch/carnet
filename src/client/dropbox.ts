@@ -275,14 +275,18 @@ export class DropboxClient {
   }
 
   /**
-   * Upload text. When `baseRev` is given the write is conditional: Dropbox
-   * rejects it (throwing WriteConflict) if the file's rev no longer matches,
-   * which is how we detect a collision with another device. With no baseRev the
-   * write overwrites unconditionally.
+   * Upload text. Never unconditional — every upload can fail with
+   * WriteConflict, and the caller decides what to do about it:
+   *  - with `baseRev`, Dropbox rejects the write if the file's rev has moved,
+   *    which is how a collision with another device is detected;
+   *  - without one we are claiming the file is new, so "add" rejects it if the
+   *    path already exists. This used to be "overwrite", which meant a lost rev
+   *    (a killed app, a torn state blob) or a note created against a
+   *    half-downloaded mirror silently destroyed the real note on Dropbox.
    */
   async upload(rel: string, content: string, baseRev?: string): Promise<{ rev: string }> {
     const token = await this.freshAccess();
-    const mode = baseRev ? { ".tag": "update", update: baseRev } : { ".tag": "overwrite" };
+    const mode = baseRev ? { ".tag": "update", update: baseRev } : { ".tag": "add" };
     const res = await this.fetch(`${CONTENT}/files/upload`, {
       method: "POST",
       headers: {

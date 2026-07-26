@@ -1,5 +1,9 @@
 # Carnet audit — 10,000 notes, phone, and never losing data
 
+> **Status: all findings below are fixed.** This document is kept as the record of
+> what was wrong and how it was measured. Jump to [After](#after) for the numbers
+> as they stand now. Anything still outstanding is listed there too.
+
 Against three requirements: the app must work with 10,000+ notes, be snappy on a
 phone, and never lose data.
 
@@ -282,6 +286,44 @@ One thing outside the three requirements, worth a look sometime:
 protocol can read any file on the machine, not just the vault.
 
 ---
+
+## After
+
+Same vault, same harness, after the fixes.
+
+| what the app does | before | after |
+|---|---:|---:|
+| backlinks under the open note | 79.6 s (whole graph rebuilt) | **0.03 ms** (reverse index) |
+| cost a save adds to the next navigation | 79.6 s (caches dropped) | **0.02 ms** (index edited in place) |
+| build the link structure, once per session | 79.6 s | **181 ms** |
+| resolve one wiki link | 1.6 ms | **0.001 ms** |
+| graph view, per frame | 379 ms (2.6 fps) | **2 ms** (~450 fps), then the loop parks |
+| graph view, nodes drawn | 10,002 nodes / 49,992 edges | **92 / 367** around the open note |
+| graph view, canvas draw calls per frame | 59,994 | **~2** batched paths + one arc per node |
+| open a 4,000-item checklist, or tick one box | 2.1 s | **0.9 ms** |
+| sidebar tree per navigation | 144 ms, always | **0 ms** unless it's on screen |
+| focus the app with nothing changed | full vault re-read | **one directory walk**, no JS |
+| note counter | every keystroke | debounced 200 ms |
+| longest a keystroke can stay unwritten | unbounded | **5 s**, and ~1 s in practice |
+| durable write cost | — | +3 ms per save (fsync) |
+
+Reproduce with `bun run bench/hot-paths.ts /tmp/vault10k`.
+
+### Still true, and deliberate
+
+- **Loading the vault is ~250 ms desktop / ~1.3 s phone**, once per session, the first time
+  something needs every note's text (backlinks, search, or the graph). It happens after the
+  note itself is on screen, and never again unless files change outside the app. Splitting it
+  into chunks would remove the last hitch; it is the obvious next thing if the phone still
+  feels slow on launch.
+- **`⌘Q` flushing is not verifiable here.** Rust defers the exit, asks the webview to flush,
+  and force-quits after 2 s regardless (so the app can never become unquittable). The deferral
+  path needs a real macOS run to confirm — `src-tauri/src/lib.rs:659`.
+- **The Android numbers are desktop × 5.** That ratio is fair for string-heavy JS in a WebView,
+  but shared-storage I/O on Android goes through a FUSE shim this machine doesn't have. The
+  file-reading numbers specifically could be worse there.
+- **`assetProtocol.scope.allow` is still `["**"]`** in `tauri.conf.json` — outside the three
+  requirements, so left alone, but worth tightening to the vault sometime.
 
 ## Fix order
 

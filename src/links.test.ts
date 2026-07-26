@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildLinkIndex,
   contentHash,
   extractLinks,
   normalizePath,
   normalizeTasks,
   resolveLink,
+  taskLines,
   taskLinesIn,
+  taskLinesInRange,
   taskState,
   todayName,
   toggleTaskAtLine,
@@ -143,12 +146,78 @@ describe("taskState", () => {
   });
 });
 
+describe("buildLinkIndex", () => {
+  // The index replaced a per-link scan of the whole vault. It has to agree
+  // with the old rules exactly, or links quietly start pointing elsewhere.
+  const vault = [
+    "2026-07-20.md",
+    "carnet.md",
+    "projects/carnet/carnet.md",
+    "projects/carnet/carnet-tasks.md",
+    "projects/other/notes.md",
+    "projects/other/carnet.md",
+    "a/b/c/deep.md",
+  ];
+
+  test("agrees with resolveLink for every name from every note", () => {
+    const index = buildLinkIndex(vault);
+    const names = [
+      "carnet", "Carnet", "carnet-tasks", "notes", "deep", "nope",
+      "projects/other/notes", "projects/carnet/carnet", "a/b/c/deep",
+      "PROJECTS/OTHER/NOTES", "projects/other/notes.md", "missing/thing",
+    ];
+    for (const from of vault) {
+      for (const name of names) {
+        expect(index.resolve(name, from)).toBe(resolveLink(name, from, vault));
+      }
+    }
+  });
+
+  test("prefers the linking note's own folder, then the shallowest", () => {
+    const index = buildLinkIndex(vault);
+    expect(index.resolve("carnet", "projects/other/notes.md")).toBe("projects/other/carnet.md");
+    expect(index.resolve("carnet", "projects/carnet/carnet-tasks.md")).toBe("projects/carnet/carnet.md");
+    expect(index.resolve("carnet", "2026-07-20.md")).toBe("carnet.md");
+  });
+
+  test("has() mirrors resolve()", () => {
+    const index = buildLinkIndex(vault);
+    expect(index.has("carnet", "2026-07-20.md")).toBe(true);
+    expect(index.has("nope", "2026-07-20.md")).toBe(false);
+  });
+
+  test("an empty vault resolves nothing rather than throwing", () => {
+    const index = buildLinkIndex([]);
+    expect(index.resolve("anything", "a.md")).toBeNull();
+    expect(index.resolve("dir/anything", "a.md")).toBeNull();
+  });
+});
+
 describe("contentHash", () => {
   test("is stable and content-sensitive", () => {
-    expect(contentHash("")).toBe("00001505");
     expect(contentHash("hello")).toBe(contentHash("hello"));
     expect(contentHash("hello")).not.toBe(contentHash("hello!"));
-    expect(contentHash("æøå")).toHaveLength(8);
+    expect(contentHash("æøå")).toHaveLength(16);
+  });
+
+  // These must stay byte-identical to djb2() in src-tauri/src/lib.rs, which
+  // pins the same vectors: the client hashes what it loaded, Rust hashes what
+  // is on disk, and the two are compared to decide whether a save is a
+  // conflict. Drift means every save looks like a conflict.
+  test("matches the Rust implementation", () => {
+    expect(contentHash("")).toBe("0000000000001505");
+    expect(contentHash("a")).toBe("000000000002b5c4");
+    expect(contentHash("hello")).toBe("000000310a9cede7");
+    expect(contentHash("# Note\n\nbody\n")).toBe("d06b5d85825c414c");
+    expect(contentHash("Grüße 👋")).toBe("b3bfb38026e3c3c3");
+  });
+
+  test("is wide enough that collisions aren't a data-loss path", () => {
+    // 32 bits gave ~1 expected silent overwrite per 12 years of heavy use
+    expect(contentHash("x")).toHaveLength(16);
+    const seen = new Set<string>();
+    for (let i = 0; i < 20000; i++) seen.add(contentHash(`note-${i}\n`));
+    expect(seen.size).toBe(20000);
   });
 });
 
@@ -158,6 +227,21 @@ describe("line-addressed tasks", () => {
   test("taskLinesIn finds task lines in a range", () => {
     expect(taskLinesIn(src, 0, 4)).toEqual([1, 2, 4]);
     expect(taskLinesIn(src, 2, 4)).toEqual([2, 4]);
+  });
+
+  test("the whole-note map and the per-range slice agree", () => {
+    const all = taskLines(src);
+    expect(all).toEqual([1, 2, 4]);
+    for (let start = 0; start <= 5; start++) {
+      for (let end = start; end <= 5; end++) {
+        expect(taskLinesInRange(all, start, end)).toEqual(taskLinesIn(src, start, end));
+      }
+    }
+  });
+
+  test("tasks inside a code fence are not tasks", () => {
+    const fenced = "- [ ] real\n\n```\n- [ ] fake\n```\n\n- [x] also real";
+    expect(taskLines(fenced)).toEqual([0, 6]);
   });
 
   test("toggleTaskAtLine flips exactly that line", () => {
