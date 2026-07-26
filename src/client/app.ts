@@ -339,6 +339,48 @@ async function loadNote(path: string): Promise<void> {
   }
 }
 
+/** One prompt at a time: the drain runs on every loop wake, and stacking
+ *  dialogs over each other would be worse than the problem. */
+let resolvingConflict = false;
+
+/**
+ * A save that was queued for upload turns out to have changed on Dropbox too.
+ * Ask the same question a foreground save asks. Without this the note sat in
+ * the outbox with a toast saying "open it to resolve" — which did nothing,
+ * because opening a note doesn't save it and doSave returns early when the
+ * note isn't dirty. The only way out was to edit it by hand.
+ */
+async function resolveOwedConflict(path: string, serverContent: string): Promise<void> {
+  if (!dropboxSync || resolvingConflict) return;
+  resolvingConflict = true;
+  try {
+    const local = (await backend.readNote(path).catch(() => null))?.content;
+    if (local === undefined) return;
+    const keepMine = await ask(
+      `"${noteTitle(path)}" changed both here and in Dropbox while it was waiting to upload. Which version should win?`,
+      { title: "Note changed in both places", okLabel: "Keep mine", cancelLabel: "Load Dropbox version" },
+    );
+    const out = await dropboxSync.resolveConflict(path, keepMine ? "mine" : "theirs", keepMine ? local : serverContent);
+    if (out.status === "conflict") {
+      toast("It changed in Dropbox again — your version is still here; try once more", 9000);
+    } else if (!keepMine) {
+      vault.invalidate();
+      if (note?.path === path) {
+        note.content = serverContent;
+        loadedHash = contentHash(serverContent);
+        dirty = false;
+        updateDirty();
+        reshowNote();
+      }
+    }
+    renderSyncState();
+  } catch (e) {
+    toast("Couldn't resolve that conflict: " + errText(e), 8000);
+  } finally {
+    resolvingConflict = false;
+  }
+}
+
 /** A note we couldn't open because the Dropbox mirror was still filling up. */
 let deferredPath: string | null = null;
 
@@ -1259,6 +1301,7 @@ async function startDropboxMode(): Promise<void> {
       renderSyncState();
     },
     onStatus: () => renderSyncState(),
+    onConflict: (path, serverContent) => void resolveOwedConflict(path, serverContent),
     onError: (m) => toast(m),
     onAuthExpired: () => {
       // Loop has already stopped. Drop the handle so saves stay local (no

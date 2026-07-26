@@ -427,7 +427,8 @@ them introduced by the fixes. What follows is the record; all but three are fixe
 
 ### Still open
 
-Three need a design decision rather than a fix, so they are deliberately not in this round:
+These needed a design decision rather than a fix, so they were deliberately left out of that
+round. Item 2 has since been fixed — and its diagnosis corrected — after verification:
 
 1. **A non-UTF-8 note is now unsaveable, and says so only in a 3-second toast.** Refusing
    to overwrite it (above) traded silent corruption for a different loss: a Latin-1 note
@@ -435,12 +436,17 @@ Three need a design decision rather than a fix, so they are deliberately not in 
    detect it on open — `read_note` reporting `valid_utf8: false` — and put the note in a
    read-only state with a persistent banner and an explicit "re-save as UTF-8" action.
    That is a UI decision about what should happen to such a note.
-2. **An owed edit that also changed remotely is wedged.** `drainOutbox` re-uploads against
-   the live rev map, which can never advance past the conflict, while the pull consumes and
-   discards the delta — so the note stays out of sync in both directions and "open it to
-   resolve" does nothing. The fix is for each outbox entry to carry the base rev its edit
-   was made against, and for a drain-time conflict to reach the same interactive prompt a
-   foreground save does, without the cursor advancing past the skipped delta.
+2. ~~**An owed edit that also changed remotely is wedged.**~~ **Fixed, and the original
+   diagnosis here was wrong.** Verification showed nothing was ever stuck: `pushNote`'s
+   conflict branch downloads the server copy fresh, so recovery never depended on the
+   consumed delta, and answering the prompt settled it in either direction. Two of the
+   remedies written here were also wrong — per-entry base revs are unnecessary for the same
+   reason, and *not* advancing the cursor past a skipped delta would have made it replay
+   that page forever. What was actually broken was the affordance: the toast said "open it
+   to resolve", and opening a note doesn't save it (`doSave` returns early when the note
+   isn't dirty), so the only way out was to edit the note by hand. A drain-time conflict now
+   raises the same keep-mine / take-theirs prompt a foreground save does, and asks once
+   rather than on every longpoll wake.
 3. **`⌘Q` and the asset-protocol grant still need a device.** Neither path can be
    exercised on Linux. The 2 s watchdog bounds the first; a failed grant surfaces as a
    toast rather than silently broken images.
