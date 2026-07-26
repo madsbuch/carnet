@@ -58,9 +58,25 @@ row("read_all_notes: JSON.parse (webview)", ms(() => JSON.parse(payload), 3), "o
 row("buildLinkIndex(paths)  [when the file list changes]", ms(() => buildLinkIndex(paths), 3));
 
 let index = new VaultIndex([]);
-row("VaultIndex build  [once, then edited in place]", ms(() => (index = new VaultIndex(notes)), 1),
+row("VaultIndex build, all at once", ms(() => (index = new VaultIndex(notes)), 1),
   `${index.graph().nodes.length} nodes, ${index.graph().edges.length} edges`);
 row("  (buildGraph, the same work done from scratch)", ms(() => buildGraph(notes), 1), "what a save used to cost");
+
+// What the app actually does: the same build, sliced, so the webview keeps
+// painting. What matters is the longest uninterrupted slice, not the total.
+{
+  let longest = 0;
+  let sliceStart = performance.now();
+  const total = performance.now();
+  await VaultIndex.build(notes, async () => {
+    longest = Math.max(longest, performance.now() - sliceStart);
+    await new Promise((r) => setTimeout(r, 0));
+    sliceStart = performance.now();
+  });
+  const wall = performance.now() - total;
+  row("VaultIndex build, sliced  [what the app runs]", longest,
+    `longest single block; ${(wall / 1000).toFixed(1)} s wall, spread over frames`);
+}
 
 /* ---- per interaction ---- */
 const mid = notes[Math.floor(notes.length / 2)]!;

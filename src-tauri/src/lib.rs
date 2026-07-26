@@ -309,6 +309,23 @@ async fn delete_note(root: String, path: String) -> Result<(), String> {
     }
 }
 
+/// Let the webview load images from inside this folder, and nowhere else.
+///
+/// Notes reference images by relative path, so the asset protocol has to be
+/// able to read the vault. It used to be configured with `allow: ["**"]`, which
+/// let a note pull in any file on the machine; the vault is only known at
+/// runtime, so the grant belongs here rather than in tauri.conf.json.
+#[tauri::command]
+async fn allow_asset_dir(app: tauri::AppHandle, root: String) -> Result<(), String> {
+    let path = Path::new(&root);
+    if !path.is_dir() {
+        return Err(format!("not a directory: {root}"));
+    }
+    tauri::Manager::asset_protocol_scope(&app)
+        .allow_directory(path, true)
+        .map_err(|e| e.to_string())
+}
+
 /// Make sure a directory exists, creating it (and parents) if needed. The
 /// Dropbox mirror lives in app-local data, which may not exist on first run.
 #[tauri::command]
@@ -786,6 +803,33 @@ mod tests {
     }
 
     #[test]
+    fn a_quit_is_deferred_exactly_once() {
+        use std::sync::atomic::AtomicBool;
+        let flag = AtomicBool::new(false);
+        // the first Cmd+Q waits for the flush...
+        assert!(should_defer_quit(&flag));
+        // ...and nothing after it does, or the app could never be quit
+        for _ in 0..5 {
+            assert!(!should_defer_quit(&flag));
+        }
+    }
+
+    #[test]
+    fn racing_quit_requests_still_defer_only_once() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let flag = Arc::new(AtomicBool::new(false));
+        let hands: Vec<_> = (0..16)
+            .map(|_| {
+                let flag = Arc::clone(&flag);
+                std::thread::spawn(move || should_defer_quit(&flag))
+            })
+            .collect();
+        let deferred = hands.into_iter().filter_map(|h| h.join().ok()).filter(|d| *d).count();
+        assert_eq!(deferred, 1, "exactly one quit may be held back");
+    }
+
+    #[test]
     fn only_md_files_can_be_written() {
         let t = Tmp::new("ext");
         assert!(write(&t, "notes.txt", "x").is_err());
@@ -805,6 +849,15 @@ async fn confirm_exit(app: tauri::AppHandle) {
 /// watchdog's own exit) isn't deferred again.
 static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Should this quit request be held back to let the webview flush?
+///
+/// Exactly once, and never again — deferring twice would leave the app unable
+/// to quit, and deferring zero times would drop whatever hadn't been saved.
+/// Extracted from the event handler so that invariant can be tested.
+fn should_defer_quit(flag: &std::sync::atomic::AtomicBool) -> bool {
+    !flag.swap(true, std::sync::atomic::Ordering::SeqCst)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
@@ -819,6 +872,7 @@ pub fn run() {
             write_note,
             delete_note,
             ensure_dir,
+            allow_asset_dir,
             read_state,
             write_state,
             safe_area_insets,
@@ -837,8 +891,7 @@ pub fn run() {
     // the webview is wedged so the app can always be quit.
     app.run(|handle, event| {
         if let tauri::RunEvent::ExitRequested { api, .. } = event {
-            use std::sync::atomic::Ordering;
-            if QUITTING.swap(true, Ordering::SeqCst) {
+            if !should_defer_quit(&QUITTING) {
                 return;
             }
             api.prevent_exit();

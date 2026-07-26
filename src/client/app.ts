@@ -4,17 +4,15 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import {
   basename,
-  buildLinkIndex,
   contentHash,
   DAILY_RE,
   dirOf,
   fuzzyScore,
   normalizePath,
   noteTitle,
-  type LinkIndex,
 } from "../links";
 import { dailyPath, searchNotes } from "../graph-data";
-import { VaultIndex } from "../vault-index";
+import { VaultCache } from "./vault-cache";
 import { countLabel } from "../counts";
 import * as backend from "./backend";
 import * as dropbox from "./dropboxmode";
@@ -44,7 +42,6 @@ const qoBrowse = $<HTMLElement>("#qo-browse");
 /** Phone-shaped viewport: browse + search live in one full-screen surface. */
 const isPhone = (): boolean => matchMedia("(max-width: 700px)").matches;
 
-let paths: string[] = [];
 let note: backend.Note | null = null;
 /** Hash of the current note's content as last seen on disk (conflict detection). */
 let loadedHash: string | null = null;
@@ -86,7 +83,7 @@ const blockView = new BlockView(previewEl, {
     scheduleNoteCount();
     scheduleSave();
   },
-  wikiExists: (name) => note !== null && linkIndex.has(name, note.path),
+  wikiExists: (name) => note !== null && vault.links().has(name, note.path),
   followWiki: (name) => followWiki(name),
   openRelative: (href) => {
     if (note) openPath(normalizePath(dirOf(note.path) + safeDecode(href)));
@@ -98,86 +95,15 @@ const blockView = new BlockView(previewEl, {
   },
 });
 
-/* ---------- caches ----------
- * Three things are cached, with three different lifetimes:
- *
- * - `linkIndex` answers "does [x] exist?" from the path list alone. The
- *   renderer needs that answer synchronously for every wiki link, so it can't
- *   wait on note bodies.
- * - `notesValue` is every note's text. It is fetched once and then PATCHED on
- *   save; it used to be thrown away on every save, which meant re-reading and
- *   re-parsing the whole vault before the next backlinks render.
- * - `vaultValue` is the link structure over those bodies. Saving a note edits
- *   it in place — O(links in that note) rather than O(vault).
- *
- * The in-flight read is shared (`notesPromise`), because the old code cached
- * the resolved value and so let concurrent callers each start their own
- * whole-vault read. */
+/* ---------- the vault ----------
+ * Path list, note bodies and link structure, with the rules for keeping them
+ * true after a save, a creation or a change made outside the app. Lives in
+ * vault-cache.ts so those rules can be tested without Tauri or a DOM. */
 
-let linkIndex: LinkIndex = buildLinkIndex([]);
-/** Resolved note bodies, once loaded. Kept as a plain array so a save can
- *  patch it synchronously. */
-let notesValue: backend.Note[] | null = null;
-/** The read in flight, shared so concurrent callers don't each start one. */
-let notesPromise: Promise<backend.Note[]> | null = null;
-let vaultValue: VaultIndex | null = null;
-/** Path + mtime of every note as last seen, so a focus that changed nothing
- *  costs one directory walk and no JS work at all. */
-let lastMeta: backend.NoteMeta[] = [];
-
-/** Adopt a new path list. Anything derived only from paths is rebuilt here. */
-function setPaths(next: string[]): void {
-  paths = next;
-  linkIndex = buildLinkIndex(paths);
-}
-
-/** The set of notes itself changed, so links may resolve differently. */
-function invalidate(): void {
-  notesValue = null;
-  notesPromise = null;
-  vaultValue = null;
-}
-
-function getAllNotes(): Promise<backend.Note[]> {
-  if (notesValue) return Promise.resolve(notesValue);
-  return (notesPromise ??= backend.readAllNotes().then(
-    (loaded) => {
-      notesValue = loaded;
-      notesPromise = null;
-      return loaded;
-    },
-    (e: unknown) => {
-      notesPromise = null; // a failed read must not cache itself forever
-      throw e;
-    },
-  ));
-}
-
-async function getVault(): Promise<VaultIndex> {
-  const loaded = await getAllNotes();
-  return (vaultValue ??= new VaultIndex(loaded));
-}
-
-/** A note was written. Patch what's cached rather than dropping it: only this
- *  note's own links can have moved, and the file's new mtime is ours, not a
- *  change from another device. */
-function noteSaved(path: string, content: string, mtime: number): void {
-  const meta = lastMeta.find((m) => m.path === path);
-  if (meta) meta.mtime = mtime;
-  if (notesPromise) {
-    // A whole-vault read is in flight and may or may not have seen this write.
-    // Not worth reconciling: drop the caches and let it be re-read on demand.
-    invalidate();
-    return;
-  }
-  if (!notesValue) return;
-  const hit = notesValue.find((n) => n.path === path);
-  if (hit) {
-    hit.content = content;
-    hit.mtime = mtime;
-  }
-  if (vaultValue?.knows(path)) vaultValue.setContent(path, content);
-}
+const vault = new VaultCache({
+  listMeta: () => backend.listNotesMeta(),
+  readAll: () => backend.readAllNotes(),
+});
 
 /* ---------- toast ---------- */
 
@@ -253,14 +179,14 @@ async function doSave(): Promise<void> {
           updateDirty();
           reshowNote();
         }
-        noteSaved(n.path, res.content, res.mtime);
+        vault.noteSaved(n.path, res.content, res.mtime);
         return;
       }
     }
     if (res.status === "ok") {
       n.mtime = res.mtime;
       if (note === n) loadedHash = contentHash(contentAtSave);
-      noteSaved(n.path, contentAtSave, res.mtime);
+      vault.noteSaved(n.path, contentAtSave, res.mtime);
     }
     if (note === n && n.content === contentAtSave) {
       dirty = false;
@@ -301,7 +227,7 @@ async function pushToDropbox(
       dirty = false;
       updateDirty();
       reshowNote();
-      invalidate();
+      vault.noteSaved(n.path, push.content, n.mtime);
     }
   } catch (e) {
     toast("Dropbox upload failed: " + e);
@@ -317,7 +243,7 @@ function openPath(path: string): void {
 }
 
 function openDaily(): void {
-  openPath(dailyPath(paths).path);
+  openPath(dailyPath(vault.paths()).path);
 }
 
 function exitGraph(): void {
@@ -375,13 +301,7 @@ async function loadNote(path: string): Promise<void> {
         created = true;
         toast("Created " + path);
       }
-      if (!paths.includes(path)) {
-        setPaths([...paths, path].sort());
-        lastMeta = [...lastMeta, { path, mtime: n.mtime }].sort((a, b) =>
-          a.path < b.path ? -1 : a.path > b.path ? 1 : 0,
-        );
-      }
-      invalidate(); // a new path can make links elsewhere resolve
+      vault.addPath(path, n.mtime);
     }
     note = n;
     loadedHash = contentHash(n.content);
@@ -398,7 +318,7 @@ async function loadNote(path: string): Promise<void> {
 
 async function openGraph(): Promise<void> {
   try {
-    const g = (await getVault()).graph();
+    const g = (await vault.vaultIndex()).graph();
     if (location.hash !== "#/graph") return; // user already navigated away
     graphView.show(g, note?.path ?? null);
   } catch (e) {
@@ -408,7 +328,7 @@ async function openGraph(): Promise<void> {
 
 function followWiki(name: string): void {
   if (!note) return;
-  const target = linkIndex.resolve(name, note.path);
+  const target = vault.links().resolve(name, note.path);
   if (target) openPath(target);
   else if (name.includes("/")) openPath(normalizePath(name) + ".md");
   else openPath(dirOf(note.path) + name + ".md");
@@ -468,7 +388,7 @@ async function renderBacklinks(): Promise<void> {
   const forPath = note.path;
   let sources: string[];
   try {
-    sources = (await getVault()).backlinks(forPath);
+    sources = await vault.backlinks(forPath);
   } catch {
     return;
   }
@@ -555,7 +475,7 @@ function ensureTree(): void {
 
 function renderTree(): void {
   const root: DirNode = { dirs: new Map(), files: [] };
-  for (const p of paths) {
+  for (const p of vault.paths()) {
     const parts = p.split("/");
     let d = root;
     for (let i = 0; i < parts.length - 1; i++) {
@@ -672,25 +592,26 @@ function updateQuickOpen(q: string): void {
   }
   if (!q) {
     qoItems = recents()
-      .filter((p) => paths.includes(p))
+      .filter((p) => vault.paths().includes(p))
       .map((p) => ({ path: p }));
     renderQoItems();
     return;
   }
-  qoItems = paths
+  qoItems = vault
+    .paths()
     .map((p) => [fuzzyScore(q, p), p] as const)
     .filter(([s]) => s >= 0)
     .sort((a, b) => b[0] - a[0])
     .slice(0, 12)
     .map(([, p]) => ({ path: p }));
-  const exact = paths.some((p) => noteTitle(p).toLowerCase() === q.toLowerCase());
+  const exact = vault.paths().some((p) => noteTitle(p).toLowerCase() === q.toLowerCase());
   if (!exact) qoItems.push({ create: q });
   renderQoItems();
   if (q.length >= 3) {
     qoSearchTimer = setTimeout(async () => {
       if (qoInput.value.trim() !== q || qoEl.hidden) return;
       try {
-        const hits = searchNotes(await getAllNotes(), q, 10).filter(
+        const hits = searchNotes(await vault.allNotes(), q, 10).filter(
           (h) => h.snippet !== null && !qoItems.some((it) => it.path === h.path),
         );
         if (qoInput.value.trim() !== q || qoEl.hidden) return;
@@ -790,14 +711,6 @@ async function applySafeArea(): Promise<void> {
 
 /* ---------- refresh on focus (Dropbox may have synced) ---------- */
 
-function sameMeta(a: backend.NoteMeta[], b: backend.NoteMeta[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i].path !== b[i].path || a[i].mtime !== b[i].mtime) return false;
-  }
-  return true;
-}
-
 // focus and visibilitychange both fire on returning to the app, which used to
 // mean two concurrent whole-vault reads racing each other.
 let refreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -818,26 +731,16 @@ async function refreshFromDisk(): Promise<void> {
   if (!started || !backend.vaultRoot() || refreshing) return;
   refreshing = true;
   try {
-    let meta: backend.NoteMeta[];
+    let moved: boolean;
     try {
-      meta = await backend.listNotesMeta();
+      moved = (await vault.refresh()).pathsMoved;
     } catch {
       return;
     }
-    if (!sameMeta(meta, lastMeta)) {
-      const nextPaths = meta.map((m) => m.path);
-      const pathsMoved =
-        nextPaths.length !== paths.length || nextPaths.some((p, i) => p !== paths[i]);
-      lastMeta = meta;
-      invalidate(); // some note's text moved, so the link structure may have too
-      if (pathsMoved) {
-        setPaths(nextPaths);
-        markTreeDirty();
-      }
-    }
+    if (moved) markTreeDirty();
     if (!note || dirty || blockView.hasActiveEdit()) return;
-    const known = lastMeta.find((m) => m.path === note!.path);
-    if (known && known.mtime === note.mtime) return; // the open note is current
+    const known = vault.knownMtime(note.path);
+    if (known !== undefined && known === note.mtime) return; // open note is current
     const before = note;
     const fresh = await backend.readNote(note.path).catch(() => null);
     // the world may have moved while we awaited — re-check everything
@@ -952,8 +855,7 @@ async function changeVault(): Promise<void> {
   backend.clearVault();
   started = false;
   note = null;
-  paths = [];
-  invalidate();
+  vault.adopt([]);
   history.replaceState(null, "", "#/");
   void showSetup();
 }
@@ -1165,9 +1067,17 @@ void listen("carnet://flush-and-exit", () => {
 /* ---------- boot ---------- */
 
 async function startApp(): Promise<void> {
+  // Every route into the app lands here before anything renders, so this is
+  // where the vault gets its one asset-protocol grant — images in notes are
+  // loaded through it, and nothing outside the vault should be.
+  const root = backend.vaultRoot();
+  if (root) {
+    await backend.allowAssetDir(root).catch(() => {
+      toast("Images inside notes may not load — couldn't grant access to the folder", 8000);
+    });
+  }
   try {
-    lastMeta = await backend.listNotesMeta();
-    setPaths(lastMeta.map((m) => m.path));
+    vault.adopt(await backend.listNotesMeta());
   } catch (e) {
     toast(String(e));
     backend.clearVault();
@@ -1183,7 +1093,7 @@ async function startApp(): Promise<void> {
 async function startDropboxMode(): Promise<void> {
   dropboxSync = await dropbox.start({
     onChanged: () => {
-      invalidate();
+      vault.invalidate();
       void refreshFromDisk();
     },
     onError: (m) => toast(m),
@@ -1200,7 +1110,7 @@ async function boot(): Promise<void> {
   setupWiki();
   void applySafeArea();
   setupLinkComplete({
-    paths: () => paths,
+    paths: () => vault.paths(),
     currentPath: () => note?.path ?? null,
     recents,
   });

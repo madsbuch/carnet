@@ -112,8 +112,13 @@ export const writeNote = (path: string, content: string, baseMtime?: number, bas
     baseHash: baseHash ?? null,
   });
 
-/** URL usable in <img src> for a file inside the vault. */
+/** URL usable in <img src> for a file inside the vault. Only works once
+ *  {@link allowAssetDir} has granted the vault to the asset protocol. */
 export const assetUrl = (rel: string) => convertFileSrc(must() + "/" + rel);
+
+/** Let the webview load images from the vault, and from nowhere else. The
+ *  static config grants nothing; the vault is only known at runtime. */
+export const allowAssetDir = (root: string) => invoke<void>("allow_asset_dir", { root });
 
 /** Remove a note from the vault (used to mirror remote Dropbox deletions). */
 export const deleteNote = (path: string) => invoke<void>("delete_note", { root: must(), path });

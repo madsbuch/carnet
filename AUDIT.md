@@ -1,8 +1,9 @@
 # Carnet audit — 10,000 notes, phone, and never losing data
 
-> **Status: all findings below are fixed.** This document is kept as the record of
-> what was wrong and how it was measured. Jump to [After](#after) for the numbers
-> as they stand now. Anything still outstanding is listed there too.
+> **Status: all findings below are fixed**, and so are the four follow-ups the first
+> pass deliberately deferred. This document is kept as the record of what was wrong
+> and how it was measured. Jump to [After](#after) for the numbers as they stand,
+> and to [Follow-up round](#follow-up-round) for what needed a second pass.
 
 Against three requirements: the app must work with 10,000+ notes, be snappy on a
 phone, and never lose data.
@@ -309,21 +310,39 @@ Same vault, same harness, after the fixes.
 
 Reproduce with `bun run bench/hot-paths.ts /tmp/vault10k`.
 
-### Still true, and deliberate
+### Follow-up round
 
-- **Loading the vault is ~250 ms desktop / ~1.3 s phone**, once per session, the first time
-  something needs every note's text (backlinks, search, or the graph). It happens after the
-  note itself is on screen, and never again unless files change outside the app. Splitting it
-  into chunks would remove the last hitch; it is the obvious next thing if the phone still
-  feels slow on launch.
-- **`⌘Q` flushing is not verifiable here.** Rust defers the exit, asks the webview to flush,
-  and force-quits after 2 s regardless (so the app can never become unquittable). The deferral
-  path needs a real macOS run to confirm — `src-tauri/src/lib.rs:659`.
-- **The Android numbers are desktop × 5.** That ratio is fair for string-heavy JS in a WebView,
-  but shared-storage I/O on Android goes through a FUSE shim this machine doesn't have. The
-  file-reading numbers specifically could be worse there.
-- **`assetProtocol.scope.allow` is still `["**"]`** in `tauri.conf.json` — outside the three
-  requirements, so left alone, but worth tightening to the vault sometime.
+The four items left open above were closed in a second pass.
+
+| what the app does | before | after |
+|---|---:|---:|
+| longest single block while loading the vault | 187 ms (935 ms phone) | **14 ms** (70 ms phone) |
+
+- **The one-time vault load no longer lands as a freeze.** Building the link structure over
+  10,000 notes is ~190 ms of straight-line work; it now runs in time-boxed slices
+  (`VaultIndex.build`, `src/vault-index.ts`) that yield between them, so the longest
+  uninterrupted block is 14 ms. Total wall time is the same ~0.3 s, but spread across frames
+  instead of blocking one.
+- **The cache rules are now testable and tested.** The path list, note bodies and link
+  structure — and the rules for keeping them true across a save, a creation, a deletion, a
+  Dropbox delta and a change made outside the app — moved out of `app.ts` into
+  `src/client/vault-cache.ts` with the filesystem injected. 19 tests drive the sequences,
+  including the two races the extracted version exists to get right (a save landing during an
+  in-flight read, and during an in-flight index build). A bug here would show as wrong
+  backlinks rather than a crash, which is exactly the kind that survives being read carefully.
+- **The quit deferral is pinned by a test.** `should_defer_quit` is extracted from the event
+  handler so the invariant can be checked: exactly one quit is ever held back, including under
+  16 racing threads. Deferring twice would make the app unquittable; deferring none would drop
+  unsaved text. *Still true:* whether macOS emits `ExitRequested` for ⌘Q at all can only be
+  confirmed on a device. The 2 s watchdog means the worst case is a slightly slow quit.
+- **The asset protocol is scoped to the vault.** `tauri.conf.json` granted `["**"]`, so a note
+  could pull in any file on the machine. It now grants nothing statically; `startApp` asks Rust
+  for the chosen folder and nothing else (`allow_asset_dir`). *Worth a device check:* if the
+  grant were to fail, images in notes would stop loading, so the failure is surfaced as a toast
+  rather than passing silently.
+- **The Android numbers are still desktop × 5.** That ratio is fair for string-heavy JS in a
+  WebView, but shared-storage I/O on Android goes through a FUSE shim this machine doesn't
+  have. The file-reading numbers specifically could be worse there.
 
 ## Fix order
 

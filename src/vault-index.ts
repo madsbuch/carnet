@@ -31,12 +31,42 @@ export class VaultIndex {
   /** Throw the structure away and build it again. Needed when the set of paths
    *  changes, since a link that was missing may now resolve (and vice versa). */
   rebuild(notes: NoteDoc[]): void {
+    this.reset(notes);
+    for (const note of notes) this.addLinks(note.path, note.content);
+  }
+
+  /**
+   * The same result as the constructor, built in time-boxed slices with an
+   * `await pause()` between them. Extracting links from every note in a
+   * 10,000-note vault is ~180 ms of straight-line work on a desktop and closer
+   * to a second on a phone; done in one go it lands as a visible freeze the
+   * first time a note's backlinks are wanted. Sliced, the webview keeps
+   * painting through it.
+   */
+  static async build(
+    notes: NoteDoc[],
+    pause: () => Promise<void>,
+    sliceMs = 8,
+  ): Promise<VaultIndex> {
+    const index = new VaultIndex();
+    index.reset(notes);
+    let sliceStart = Date.now();
+    for (const note of notes) {
+      index.addLinks(note.path, note.content);
+      if (Date.now() - sliceStart >= sliceMs) {
+        await pause();
+        sliceStart = Date.now();
+      }
+    }
+    return index;
+  }
+
+  private reset(notes: NoteDoc[]): void {
     this.paths = notes.map((n) => n.path);
     this.links = buildLinkIndex(this.paths);
     this.outgoing = new Map();
     this.incoming = new Map();
     this.missing = new Map();
-    for (const note of notes) this.addLinks(note.path, note.content);
   }
 
   /** One note's text changed. Only its own links move. */
