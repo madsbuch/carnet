@@ -511,6 +511,69 @@ describe("DropboxSync", () => {
     expect(h.errors.join(" ")).toContain("a.md");
   });
 
+  test("a re-send carries the newest local text, not the text that failed", async () => {
+    const uploaded: string[] = [];
+    const h = harness((url, init) => {
+      if (url.endsWith("/upload")) {
+        if (uploaded.length === 0 && !online) throw new Error("network down");
+        uploaded.push(init!.body as string);
+        return json({ rev: "rNew" });
+      }
+      return json({});
+    });
+    let online = false;
+    await h.mirror.write("a.md", "first attempt");
+    await expect(h.sync.pushNote("a.md", "first attempt", undefined)).rejects.toThrow();
+
+    // the user keeps writing while offline; the mirror holds the newer text
+    await h.mirror.write("a.md", "second, newer attempt");
+    online = true;
+    await h.sync.drainOutbox();
+
+    expect(uploaded).toEqual(["second, newer attempt"]);
+    expect(h.sync.pendingUploads()).toBe(0);
+  });
+
+  test("an incomplete initial sync leaves no cursor, so nothing claims to be synced", async () => {
+    let downloads = 0;
+    const h = harness((url) => {
+      if (url.endsWith("/list_folder"))
+        return json({
+          entries: [
+            { ".tag": "file", path_display: "/a.md", rev: "r1" },
+            { ".tag": "file", path_display: "/b.md", rev: "r2" },
+          ],
+          cursor: "C1",
+          has_more: false,
+        });
+      if (++downloads === 2) throw new Error("connection dropped mid-sync");
+      return new Response("body", { status: 200, headers: { "Dropbox-API-Result": '{"rev":"r1"}' } });
+    });
+    await expect(h.sync.initialSync()).rejects.toThrow();
+    // half the vault is on disk; claiming "synced" here is what let the app
+    // create an empty note over a real one
+    expect(h.sync.isSynced()).toBe(false);
+  });
+
+  test("a partial second page does not advance the cursor either", async () => {
+    let pages = 0;
+    let downloads = 0;
+    const h = harness((url) => {
+      if (url.endsWith("/list_folder") || url.endsWith("/list_folder/continue")) {
+        pages++;
+        return json({
+          entries: [{ ".tag": "file", path_display: `/p${pages}.md`, rev: `r${pages}` }],
+          cursor: `C${pages}`,
+          has_more: pages < 3,
+        });
+      }
+      if (++downloads === 2) throw new Error("dropped");
+      return new Response("body", { status: 200, headers: { "Dropbox-API-Result": '{"rev":"rX"}' } });
+    });
+    await expect(h.sync.initialSync()).rejects.toThrow();
+    expect(h.sync.isSynced()).toBe(false);
+  });
+
   test("isSynced only becomes true once a full listing has landed", async () => {
     const h = harness((url) => {
       if (url.endsWith("/list_folder"))
