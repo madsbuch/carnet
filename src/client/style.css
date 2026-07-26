@@ -230,6 +230,18 @@ body.sidebar-open #sidebar { transform: none; }
   outline: none;
   overflow: hidden;
 }
+/* Counters: faint, right-aligned, tabular so the digits don't jitter while
+   typing. The block's sits under its editor, the note's under the whole note. */
+.block-count, #notecount {
+  color: var(--faint);
+  font-size: 11px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.block-count { margin-top: 3px; }
+.block-count:empty { display: none; }
+#notecount { margin-top: 28px; }
+
 .markdown > :first-child { margin-top: 0; }
 .markdown h1, .markdown h2, .markdown h3, .markdown h4 {
   line-height: 1.3;

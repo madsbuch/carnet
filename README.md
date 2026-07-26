@@ -18,6 +18,9 @@ directly. There is no server and no database; Dropbox does all the syncing.
 - **TODOs** — `- [ ]` checkboxes are clickable in the rendered view and write straight back
   to the file.
 - **Backlinks** — every note lists the notes that link to it.
+- **Counts** — a faint `words · chars` line under the note, and the same under the block
+  you're editing, live as you type. Markdown's own dressing (`#`, `- [x]`, fences, `---`)
+  never counts as a word; CJK counts per character.
 - **Quick open** — `⌘K` (or `/`): fuzzy filename matching plus full-text search; type a new
   name to create a note.
 - **Sync-aware** — notes re-read when the app regains focus; if a save collides with an edit
@@ -174,6 +177,7 @@ They're also on each run's **Artifacts** if you need a specific commit's build.
 ```
 src/links.ts        [wiki-link] parsing + resolution, task toggling (shared, pure)
 src/graph-data.ts   link graph, search, daily-note logic (shared, pure)
+src/counts.ts       word / character counting (shared, pure)
 src/client/         the UI: app.ts, graph.ts (canvas), wiki.ts (marked extension)
 src/dev.ts          dev-only hot-reload server for `tauri dev`
 src-tauri/          Rust: filesystem commands (list/read/write, conflict detection)

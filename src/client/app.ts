@@ -3,6 +3,7 @@ import { homeDir } from "@tauri-apps/api/path";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { basename, contentHash, DAILY_RE, dirOf, fuzzyScore, normalizePath, noteTitle, resolveLink } from "../links";
 import { buildGraph, dailyPath, searchNotes, type GraphData } from "../graph-data";
+import { countLabel } from "../counts";
 import * as backend from "./backend";
 import * as dropbox from "./dropboxmode";
 import type { DropboxSync } from "./dropboxsync";
@@ -16,6 +17,7 @@ const $ = <T extends HTMLElement>(sel: string): T => document.querySelector(sel)
 const previewEl = $<HTMLElement>("#preview");
 const editorEl = $<HTMLTextAreaElement>("#editor");
 const backlinksEl = $<HTMLElement>("#backlinks");
+const countEl = $<HTMLElement>("#notecount");
 const treeEl = $<HTMLElement>("#tree");
 const toastEl = $<HTMLElement>("#toast");
 const qoEl = $<HTMLElement>("#quickopen");
@@ -66,6 +68,7 @@ const blockView = new BlockView(previewEl, {
     note.content = next;
     dirty = true;
     updateDirty();
+    updateNoteCount();
     scheduleSave();
   },
   wikiExists: (name) => note !== null && resolveLink(name, note.path, paths) !== null,
@@ -157,8 +160,7 @@ async function doSave(): Promise<void> {
           loadedHash = contentHash(res.content);
           dirty = false;
           updateDirty();
-          if (editing) editorEl.value = n.content;
-          else renderPreview();
+          reshowNote();
         }
         invalidate();
         return;
@@ -207,8 +209,7 @@ async function pushToDropbox(
       loadedHash = contentHash(push.content);
       dirty = false;
       updateDirty();
-      if (editing) editorEl.value = n.content;
-      else renderPreview();
+      reshowNote();
       invalidate();
     }
   } catch (e) {
@@ -322,6 +323,7 @@ function renderAll(): void {
   updateDirty();
   if (editing) showEditor();
   else showPreview(false);
+  updateNoteCount(); // after the mode switch: it reads the live block editor
   renderTree();
 }
 
@@ -329,6 +331,23 @@ function renderPreview(): void {
   if (!note) return;
   blockView.render();
   void renderBacklinks();
+}
+
+/** Re-show the open note after its content changed underneath us (a conflict
+ *  resolved, a sync landed) — in whichever mode is on screen. */
+function reshowNote(): void {
+  if (!note) return;
+  if (editing) editorEl.value = note.content;
+  else renderPreview();
+  updateNoteCount();
+}
+
+/** Words + characters of the whole note, counting the block being edited as it
+ *  is typed (pendingContent), not as it was last committed. */
+function updateNoteCount(): void {
+  const label = note ? countLabel(editing ? note.content : blockView.pendingContent()) : "";
+  countEl.textContent = label;
+  countEl.hidden = label === "";
 }
 
 async function renderBacklinks(): Promise<void> {
@@ -653,8 +672,7 @@ async function refreshFromDisk(): Promise<void> {
   if (fresh.mtime !== note.mtime) {
     note = fresh;
     loadedHash = contentHash(fresh.content);
-    if (editing) editorEl.value = fresh.content;
-    else renderPreview();
+    reshowNote();
     toast("Updated from disk");
   }
 }
@@ -866,9 +884,14 @@ editorEl.addEventListener("input", () => {
   note.content = editorEl.value;
   dirty = true;
   updateDirty();
+  updateNoteCount();
   scheduleSave();
   autoSize();
 });
+
+// Block editors live inside #preview and their input events bubble, so the
+// note's counter follows a block being typed without waiting for the commit.
+previewEl.addEventListener("input", () => updateNoteCount());
 
 document.addEventListener("keydown", (e) => {
   if (!started && setupEl.hidden === false) return;

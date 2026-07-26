@@ -28,6 +28,7 @@ import {
   type Block,
   type TargetType,
 } from "../blocks";
+import { countLabel } from "../counts";
 import { normalizeTasks, taskLinesIn, taskState, toggleTaskAtLine } from "../links";
 import { insertWikiLink } from "./linkcomplete";
 
@@ -90,6 +91,26 @@ export class BlockView {
 
   hasActiveEdit(): boolean {
     return this.active !== null;
+  }
+
+  /**
+   * The note as it would read if the active edit committed right now — plain
+   * file content when nothing is being edited. Lets whole-file views (the note
+   * counter) follow typing without a commit per keystroke. Mirrors the splice
+   * commit() performs, so the two can never disagree.
+   */
+  pendingContent(): string {
+    const a = this.active;
+    const content = this.host.content();
+    if (!a) return content;
+    const lines = content.split("\n");
+    if (a.append) {
+      if (a.textarea.value.trim() === "") return content;
+      lines.push("", ...a.textarea.value.split("\n"));
+    } else {
+      lines.splice(a.start, a.end - a.start + 1, ...a.textarea.value.split("\n"));
+    }
+    return lines.join("\n");
   }
 
   /** Flush and close any edit session without re-rendering (navigation). */
@@ -359,6 +380,14 @@ export class BlockView {
     const textarea = document.createElement("textarea");
     textarea.value = text;
     textarea.spellcheck = false;
+    // this block's own counter, under its editor — every mutation below either
+    // fires input (typing, the link button) or lands in sizeTextarea
+    const counter = document.createElement("div");
+    counter.className = "block-count";
+    const syncCounter = (): void => {
+      counter.textContent = countLabel(textarea.value);
+    };
+    syncCounter();
     for (const tool of TOOLS) {
       const btn = document.createElement("button");
       btn.type = "button";
@@ -385,13 +414,17 @@ export class BlockView {
         }
         textarea.value = convertBlock(textarea.value, tool.t);
         this.sizeTextarea(textarea);
+        syncCounter();
         textarea.focus();
         const firstLineEnd = textarea.value.includes("\n") ? textarea.value.indexOf("\n") : textarea.value.length;
         textarea.setSelectionRange(firstLineEnd, firstLineEnd);
       });
       bar.appendChild(btn);
     }
-    textarea.addEventListener("input", () => this.sizeTextarea(textarea));
+    textarea.addEventListener("input", () => {
+      this.sizeTextarea(textarea);
+      syncCounter();
+    });
     textarea.addEventListener("keydown", (e) => this.onEditorKey(e, textarea));
     textarea.addEventListener("blur", () => {
       this.commit(false, true);
@@ -400,7 +433,7 @@ export class BlockView {
         if (this.staleDom && !this.active) this.rerenderKeepScroll();
       }, 250);
     });
-    wrap.append(bar, textarea);
+    wrap.append(bar, textarea, counter);
     return wrap;
   }
 
@@ -490,25 +523,28 @@ export class BlockView {
     const changed = value !== a.original;
     if (changed) {
       const lines = this.host.content().split("\n");
+      // The session's range is moved onto the new lines *before* the host is
+      // told: update() is observable (the note counter reads pendingContent),
+      // and a range still pointing at the pre-splice lines would misread it.
       if (a.append) {
         if (value.trim() !== "") {
           a.start = lines.length + 1; // after the separating blank
           lines.push("", ...newLines);
-          this.host.update(lines.join("\n"));
           a.append = false;
           a.end = a.start + newLines.length - 1;
           this.lineDelta = 0;
           this.commitEnd = Number.MAX_SAFE_INTEGER;
           this.staleShifted = true;
+          this.host.update(lines.join("\n"));
         }
       } else {
         lines.splice(a.start, a.end - a.start + 1, ...newLines);
-        this.host.update(lines.join("\n"));
         a.end = a.start + newLines.length - 1;
         // cumulative vs the rendered DOM, not vs the previous flush
         this.lineDelta = a.end - a.domEnd;
         this.commitEnd = a.domEnd;
         this.staleShifted = true;
+        this.host.update(lines.join("\n"));
       }
       a.original = value;
     }
