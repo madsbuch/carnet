@@ -72,6 +72,33 @@ body {
   white-space: nowrap;
 }
 #dirty-dot { color: var(--accent); font-size: 10px; }
+
+/* Sync state: ambient and out of the way when things are fine, legible when
+   they are not. Sits between the title and the buttons. */
+#syncstate {
+  flex: none;
+  font: inherit;
+  font-size: 11px;
+  color: var(--faint);
+  background: none;
+  border: 0;
+  padding: 2px 6px;
+  border-radius: 6px;
+  white-space: nowrap;
+  cursor: default;
+}
+#syncstate.busy { color: var(--muted); }
+#syncstate.behind { color: var(--muted); }
+#syncstate.stuck {
+  color: var(--danger);
+  cursor: pointer;
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, transparent);
+}
+@media (max-width: 700px) {
+  /* on a phone the title has to give way first, but this must not vanish */
+  #syncstate { font-size: 10px; padding: 2px 4px; }
+}
+
 #actions { display: flex; gap: 2px; }
 
 button.icon {

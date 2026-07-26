@@ -30,7 +30,10 @@ directly. There is no server and no database; Dropbox does all the syncing.
 - **Quick open** — `⌘K` (or `/`): fuzzy filename matching plus full-text search; type a new
   name to create a note.
 - **Sync-aware** — notes re-read when the app regains focus; if a save collides with an edit
-  synced from another device you choose which version wins.
+  synced from another device you choose which version wins. In Dropbox mode the header says
+  where sync stands — `Synced`, `Fetching notes… 1,240`, `3 to upload`, `Offline`, or
+  `Dropbox disconnected` — so you never have to guess whether your writing has left the
+  phone.
 - **Hard to lose writing** — typing reaches the file within a second and never sits unwritten
   for more than five, even mid-paragraph; the app flushes before it quits, backgrounds, or
   closes. Files are written whole and fsynced, so a crash or a flat battery leaves either the
