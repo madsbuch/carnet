@@ -205,6 +205,14 @@ export class DropboxSync {
     // A file we already have at this exact rev needs no download — this makes
     // the loop idempotent and ignores the echo of our own uploads.
     if (this.revs.get(d.rel) === d.rev) return;
+    // Never let a pull overwrite an edit that hasn't been uploaded yet: that
+    // local text is the only copy of it. Leaving the rev unrecorded means the
+    // download is retried once the edit is delivered, and drainOutbox will
+    // report the collision in the meantime.
+    if (this.store.get(OUTBOX_PREFIX + d.rel) !== null) {
+      this.hooks.onError(`${d.rel} changed in Dropbox but has unsent local edits`);
+      return;
+    }
     const { content, rev } = await this.client.download(d.rel);
     await this.mirror.write(d.rel, content);
     this.revs.set(d.rel, rev);

@@ -63,11 +63,6 @@ fn read_text(p: &Path) -> Result<String, String> {
     Ok(normalize_eol(&String::from_utf8_lossy(&bytes)))
 }
 
-fn is_valid_utf8(p: &Path) -> Result<bool, String> {
-    let bytes = fs::read(p).map_err(|e| e.to_string())?;
-    Ok(std::str::from_utf8(&bytes).is_ok())
-}
-
 /// Everything above the filesystem works in "\n". A file that uses CRLF keeps
 /// it: the content is normalized on the way in and restored on the way out, so
 /// editing one block can't leave a note with mixed endings.
@@ -77,12 +72,6 @@ fn normalize_eol(s: &str) -> String {
     } else {
         s.to_string()
     }
-}
-
-fn file_uses_crlf(p: &Path) -> bool {
-    fs::read(p)
-        .map(|b| b.windows(2).any(|w| w == b"\r\n"))
-        .unwrap_or(false)
 }
 
 /// djb2-xor over UTF-8 bytes, hex-encoded — MUST stay identical to
@@ -273,15 +262,18 @@ fn write_note_impl(
     let abs = safe_join(root, path)?;
     let mut crlf = false;
     if abs.is_file() {
+        // One read answers all three questions below — the UTF-8 check, the
+        // line endings, and the change check.
+        let bytes = fs::read(&abs).map_err(|e| e.to_string())?;
         // The client only ever holds a lossy decode of a non-UTF-8 file, so
         // writing it back would swap the original bytes for U+FFFD, for good.
         // Refuse instead: the note stays readable, just not editable.
-        if !is_valid_utf8(&abs)? {
+        let Ok(text) = std::str::from_utf8(&bytes) else {
             return Err(format!("{path} is not valid UTF-8 — refusing to overwrite it"));
-        }
-        crlf = file_uses_crlf(&abs);
+        };
+        crlf = bytes.windows(2).any(|w| w == b"\r\n");
+        let disk = normalize_eol(text);
         if let Some(hash) = &base_hash {
-            let disk = read_text(&abs)?;
             if djb2(&disk) != *hash {
                 let mtime = mtime_ms(&abs)?;
                 return Ok(SaveResult::Conflict { content: disk, mtime });
@@ -289,7 +281,6 @@ fn write_note_impl(
         } else if let Some(base) = base_mtime {
             let current = mtime_ms(&abs)?;
             if current.abs_diff(base) > 1 {
-                let disk = read_text(&abs)?;
                 return Ok(SaveResult::Conflict { content: disk, mtime: current });
             }
         }

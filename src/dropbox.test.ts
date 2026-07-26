@@ -486,6 +486,31 @@ describe("DropboxSync", () => {
     expect(h.sync.pendingUploads()).toBe(2);
   });
 
+  test("a pull will not overwrite a note whose upload is still owed", async () => {
+    const h = harness((url) => {
+      if (url.endsWith("/upload")) throw new Error("network down");
+      if (url.endsWith("/list_folder"))
+        return json({
+          entries: [{ ".tag": "file", path_display: "/a.md", rev: "rServer" }],
+          cursor: "C1",
+          has_more: false,
+        });
+      return new Response("the server's version", {
+        status: 200,
+        headers: { "Dropbox-API-Result": '{"rev":"rServer"}' },
+      });
+    });
+    await h.mirror.write("a.md", "my only copy of this edit");
+    await expect(h.sync.pushNote("a.md", "my only copy of this edit", undefined)).rejects.toThrow();
+
+    // a remote change to the same note arrives before the edit could be sent
+    await h.sync.initialSync();
+
+    expect(await h.mirror.read("a.md")).toBe("my only copy of this edit");
+    expect(h.sync.pendingUploads()).toBe(1);
+    expect(h.errors.join(" ")).toContain("a.md");
+  });
+
   test("isSynced only becomes true once a full listing has landed", async () => {
     const h = harness((url) => {
       if (url.endsWith("/list_folder"))
