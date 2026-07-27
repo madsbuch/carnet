@@ -43,6 +43,14 @@ export interface SyncHooks {
   onProgress?(fetched: number): void;
   /** Anything that changes what {@link DropboxSync.status} would report. */
   onStatus?(): void;
+  /**
+   * A save that was waiting to upload turns out to have changed on Dropbox too.
+   * The local text is untouched and still owed; this is the app's cue to raise
+   * the same keep-mine / take-theirs prompt a foreground save gets. Without it
+   * the only recovery was to edit the note by hand — a save alone does nothing,
+   * since doSave returns early when the note isn't dirty.
+   */
+  onConflict?(rel: string, serverContent: string): void;
   /** Non-fatal problem worth surfacing (e.g. a toast). */
   onError(message: string): void;
   /** Auth died (token revoked/expired); the loop has stopped and the user must
@@ -158,6 +166,9 @@ export class DropboxSync {
   private serverRevs = new Map<string, string>();
   /** Notes downloaded this session, for progress reporting. */
   private fetched = 0;
+  /** Paths already raised as conflicts, so an unanswered prompt isn't offered
+   *  again on every longpoll wake. Cleared when the conflict is resolved. */
+  private announced = new Set<string>();
   /** The last network attempt failed (offline, flaky, rate-limited). */
   private failing = false;
   /** Auth is dead; the loop has stopped and only the user can fix it. */
@@ -340,6 +351,7 @@ export class DropboxSync {
       const { rev } = await this.client.upload(rel, content, baseRev || undefined);
       this.revs.set(rel, rev);
       this.store.remove(OUTBOX_PREFIX + rel);
+      this.announced.delete(rel);
       return { status: "ok" };
     } catch (e) {
       if (e instanceof WriteConflict) {
@@ -375,6 +387,7 @@ export class DropboxSync {
       if (serverRev !== undefined) this.revs.set(rel, serverRev);
       this.serverRevs.delete(rel);
       this.store.remove(OUTBOX_PREFIX + rel);
+      this.announced.delete(rel);
       return { status: "ok" };
     }
     const out = await this.pushNote(rel, content, serverRev);
@@ -405,14 +418,18 @@ export class DropboxSync {
         continue;
       }
       try {
-        const { rev } = await this.client.upload(rel, content, this.revs.get(rel));
-        this.revs.set(rel, rev);
-        this.store.remove(OUTBOX_PREFIX + rel);
-      } catch (e) {
-        if (e instanceof WriteConflict) {
-          this.hooks.onError(`${rel} changed in Dropbox too — open it to resolve`);
-          continue;
+        // Through pushNote, so a collision takes the same route a foreground
+        // save does: the server copy is fetched, its rev cached for a later
+        // "keep mine", and the note stays owed.
+        const out = await this.pushNote(rel, content, this.revs.get(rel));
+        if (out.status === "conflict") {
+          if (this.announced.has(rel)) continue; // asked already; don't nag every wake
+          this.announced.add(rel);
+          if (this.hooks.onConflict) this.hooks.onConflict(rel, out.content);
+          else this.hooks.onError(`${rel} also changed in Dropbox — open it and save to resolve`);
         }
+      } catch (e) {
+        if (e instanceof WriteConflict) continue; // pushNote reports these
         return; // still offline: everything else is owed too, try again later
       }
     }

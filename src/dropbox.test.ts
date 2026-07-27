@@ -674,6 +674,56 @@ describe("DropboxSync", () => {
     });
   });
 
+  test("an owed note that also moved remotely raises a resolvable conflict, once", async () => {
+    let online = false;
+    const conflicts: { rel: string; server: string }[] = [];
+    const { fetch } = fakeFetch((url) => {
+      if (url.endsWith("/upload")) {
+        if (!online) throw new Error("network down");
+        return new Response('{"error_summary":"path/conflict"}', { status: 409 });
+      }
+      if (url.endsWith("/download"))
+        return new Response("the desktop's edit", {
+          status: 200,
+          headers: { "Dropbox-API-Result": '{"rev":"rServer"}' },
+        });
+      return json({});
+    });
+    const mirror = new MemMirror();
+    const store = new MemStore();
+    const sync = new DropboxSync(
+      new DropboxClient(tokens(), "APPKEY", "", fetch),
+      mirror,
+      store,
+      {
+        onChanged: () => {},
+        onError: () => {},
+        onConflict: (rel, server) => conflicts.push({ rel, server }),
+      },
+      noSleep,
+    );
+
+    await mirror.write("a.md", "my offline edit");
+    store.set("carnet.dropbox.rev.a.md", "r1");
+    await expect(sync.pushNote("a.md", "my offline edit", "r1")).rejects.toThrow();
+
+    online = true;
+    await sync.drainOutbox();
+    expect(conflicts).toEqual([{ rel: "a.md", server: "the desktop's edit" }]);
+    expect(await mirror.read("a.md")).toBe("my offline edit"); // untouched
+    expect(sync.status().pending).toBe(1);
+
+    // the loop wakes repeatedly; the user must not be asked again each time
+    await sync.drainOutbox();
+    await sync.drainOutbox();
+    expect(conflicts).toHaveLength(1);
+
+    // ...and answering it clears the queue, which is what "3 to upload" needs
+    await sync.resolveConflict("a.md", "theirs", "the desktop's edit");
+    expect(sync.status().pending).toBe(0);
+    expect(await mirror.read("a.md")).toBe("the desktop's edit");
+  });
+
   test("isSynced only becomes true once a full listing has landed", async () => {
     const h = harness((url) => {
       if (url.endsWith("/list_folder"))
